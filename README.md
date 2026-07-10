@@ -4,7 +4,7 @@ I build this tool to get a cloudflared quicktunnel URL to use ComfyUI from my lo
 
 -------------------------
 
-It'a s small, stdlib-only Python utility that:
+It'a s small, stdlib-only Python tool to expose ComfyUI with Cloudflared Quick Tunnel, write the current URL to files/HTTP, and upload to web space via FTPS.:
 
 - Starts a Cloudflared Quick Tunnel to expose a local ComfyUI (or any HTTP service).
 - Detects the rotating Quick Tunnel URL from Cloudflared logs.
