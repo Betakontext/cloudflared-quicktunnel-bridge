@@ -55,7 +55,7 @@ If unset, the script auto-discovers cloudflared next to the script or on PATH
 
 ----------------------
 
-2) Create a .env file next to the script (recommended):
+Create a .env file next to the script (recommended):
 
     COMFY_URL=http://127.0.0.1:8188 # ComfyUI (or any local HTTP service you want to expose)
     OUT_DIR=./bridge_output  # Output directory for local copies of tunnel_url.json/txt
@@ -72,7 +72,7 @@ If unset, the script auto-discovers cloudflared next to the script or on PATH
     FTPS_RETRIES=5 # optional
 
 
-3) Run:
+#### Run:
 
     python cf_quicktunnel_writer.py
 
@@ -165,13 +165,7 @@ If cloudflared.exe is in the same folder, no extra flag is needed. Otherwise pas
 - Port in use:
 - Change HTTP_PORT or stop the conflicting service.
 
-#### How it Works (Overview)
 
-- Spawns Cloudflared as a subprocess and reads its stdout line-by-line.
-- Detects the rotating Quick Tunnel URL with a regex for trycloudflare.com.
-- Writes the URL to local JSON/TXT atomically; optionally uploads via FTPS.
-- Runs a small HTTP server in a background thread for LAN pull.
-- Restarts Cloudflared with a backoff if the subprocess exits.
 
 #### License
 
