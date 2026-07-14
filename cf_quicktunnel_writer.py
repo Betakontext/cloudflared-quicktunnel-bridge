@@ -33,7 +33,7 @@ ENV highlights:
   FTPS_PASS=...
   FTPS_DIR=/dev.betakontext.de/slAIdshow/bridge
   FTPS_RESTART_FLAG=restart.flag                 # cloudflared restart flag in FTPS_DIR root
-  FTPS_STOP_FLAG_NAME=stop.flag                  # NEW: comfy stop flag filename (in comfy subdir)
+  FTPS_STOP_FLAG_NAME=stop.flag                  # comfy stop flag filename (in comfy subdir)
   FTPS_CHECK_INTERVAL=30
   FTPS_FLAG_ACTION=cloudflared|comfy|both
   FTPS_COMFY_SUBDIR=comfy
@@ -41,10 +41,10 @@ ENV highlights:
   # Local Comfy watchers/actions
   COMFY_FLAG_WATCH_DIR=C:\\bridge\\comfy
   COMFY_FLAG_NAME=restart.flag                   # local comfy restart flag
-  COMFY_STOP_FLAG_NAME=stop.flag                 # NEW: local comfy stop flag
+  COMFY_STOP_FLAG_NAME=stop.flag                 # local comfy stop flag
   COMFY_SERVICE_NAME=comfyui
   COMFY_RESTART_CMD=powershell -ExecutionPolicy Bypass -File ".\\restart_comfyui.ps1"
-  COMFY_STOP_CMD=powershell -ExecutionPolicy Bypass -File ".\\stop_comfyui.ps1"     # NEW
+  COMFY_STOP_CMD=powershell -ExecutionPolicy Bypass -File ".\\stop_comfyui.ps1"
   COMFY_WATCH_INTERVAL=2.0
 
 Notes:
@@ -71,7 +71,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Optional, Tuple, Dict, Any, List
 
 # ====== Regex to detect TryCloudflare URLs in cloudflared logs ======
-TRYCF_RE = re.compile(r"https://[a-z0-9\\-]+\\.trycloudflare\\.com", re.IGNORECASE)
+# Use a raw-string and single backslashes to avoid double-escaping pitfalls.
+TRYCF_RE = re.compile(r"https://[a-z0-9\-]+\.trycloudflare\.com", re.IGNORECASE)
 
 # ====== .env loader (stdlib) ======
 
@@ -397,7 +398,8 @@ class TunnelWriter:
                 if self.restart_evt.is_set():
                     print("[cloudflared] log reader noticed restart request", flush=True)
                     break
-                line = line.rstrip("\\r\\n")
+                # Normalize line endings robustly, do not double-escape
+                line = line.rstrip("\r\n")
                 print(f"[cloudflared] {line}", flush=True)
                 m = TRYCF_RE.search(line)
                 if m:
@@ -477,13 +479,13 @@ class HealthWatcher(threading.Thread):
                 code = getattr(resp, "status", 200)
                 return 200 <= int(code) < 500
         except Exception as e:
-            sys.stdout.write(f"[health] check error: {e}\\n")
+            sys.stdout.write(f"[health] check error: {e}\n")
             return False
 
     def run(self):
         if not self.target_url:
             return
-        sys.stdout.write(f"[health] watcher started target={self.target_url} interval={self.interval}s threshold={self.threshold}\\n")
+        sys.stdout.write(f"[health] watcher started target={self.target_url} interval={self.interval}s threshold={self.threshold}\n")
         while not self._stop.is_set():
             ok = self._check_once()
             if ok:
@@ -491,7 +493,7 @@ class HealthWatcher(threading.Thread):
             else:
                 self._fails += 1
                 if self._fails >= self.threshold:
-                    sys.stdout.write("[health] threshold reached -> soft restart cloudflared\\n")
+                    sys.stdout.write("[health] threshold reached -> soft restart cloudflared\n")
                     try:
                         self.tw.request_restart()
                     except Exception:
@@ -508,10 +510,10 @@ class HealthWatcher(threading.Thread):
 # Global COMFY settings for local watcher and FTPS comfy exec
 COMFY_FLAG_WATCH_DIR = ""
 COMFY_FLAG_NAME = "restart.flag"
-COMFY_STOP_FLAG_NAME = "stop.flag"       # NEW
+COMFY_STOP_FLAG_NAME = "stop.flag"
 COMFY_SERVICE_NAME = "comfyui"
 COMFY_RESTART_CMD = ""
-COMFY_STOP_CMD = ""                      # NEW
+COMFY_STOP_CMD = ""
 COMFY_WATCH_INTERVAL = 2.0
 
 def _exec_shell_cmd(cmd: str, label: str) -> bool:
@@ -603,7 +605,7 @@ class FtpsFlagWatcher(threading.Thread):
             _ftps_mkdirs(ftps, path)
             ftps.cwd(path)
         except Exception as e:
-            sys.stdout.write(f"[flag] cannot access {path}: {e}\\n")
+            sys.stdout.write(f"[flag] cannot access {path}: {e}\n")
             return False
         names = ftps_list_names(ftps)
         return fname in names
@@ -613,11 +615,11 @@ class FtpsFlagWatcher(threading.Thread):
             ftps.cwd(path or "/")
             removed = ftps_delete_if_exists(ftps, fname)
             if removed:
-                sys.stdout.write(f"[flag] removed {fname} from {path}\\n")
+                sys.stdout.write(f"[flag] removed {fname} from {path}\n")
             else:
-                sys.stdout.write(f"[flag] delete failed for {path}/{fname} (continuing)\\n")
+                sys.stdout.write(f"[flag] delete failed for {path}/{fname} (continuing)\n")
         except Exception as e:
-            sys.stdout.write(f"[flag] delete error {path}/{fname}: {e}\\n")
+            sys.stdout.write(f"[flag] delete error {path}/{fname}: {e}\n")
 
     def _one_cycle(self):
         if not self.enabled or not (self.host and self.user and self.password and self.remote_dir):
@@ -630,33 +632,32 @@ class FtpsFlagWatcher(threading.Thread):
                 if self.action in ("cloudflared", "both"):
                     if self.flag_name:
                         if self._check_path_for_name(ftps, root_path, self.flag_name):
-                            sys.stdout.write(f"[flag] detected {self.flag_name} in {root_path}\\n")
+                            sys.stdout.write(f"[flag] detected {self.flag_name} in {root_path}\n")
                             self._delete_flag(ftps, root_path, self.flag_name)
                             self._handle_cloudflared()
 
                 if self.action in ("comfy", "both"):
-                    # Check comfy restart.flag (reuse FTPS_RESTART_FLAG name if used for comfy? We keep restart.flag implicit)
                     restart_flag = "restart.flag"
                     # Restart
                     if self._check_path_for_name(ftps, comfy_path, restart_flag):
-                        sys.stdout.write(f"[flag] detected {restart_flag} in {comfy_path}\\n")
+                        sys.stdout.write(f"[flag] detected {restart_flag} in {comfy_path}\n")
                         self._delete_flag(ftps, comfy_path, restart_flag)
                         self._handle_comfy_restart()
                     # Stop
                     if self._check_path_for_name(ftps, comfy_path, self.comfy_stop_flag):
-                        sys.stdout.write(f"[flag] detected {self.comfy_stop_flag} in {comfy_path}\\n")
+                        sys.stdout.write(f"[flag] detected {self.comfy_stop_flag} in {comfy_path}\n")
                         self._delete_flag(ftps, comfy_path, self.comfy_stop_flag)
                         self._handle_comfy_stop()
 
         except Exception as e:
-            sys.stdout.write(f"[flag] check error: {e}\\n")
+            sys.stdout.write(f"[flag] check error: {e}\n")
 
     def run(self):
         if not self.enabled:
             return
         sys.stdout.write(f"[flag] watcher started root={self.remote_dir} comfy_subdir={self.comfy_subdir or '(root)'} "
                          f"root_flag={self.flag_name or '(none)'} stop_flag={self.comfy_stop_flag} "
-                         f"interval={self.interval}s action={self.action}\\n")
+                         f"interval={self.interval}s action={self.action}\n")
         while not self._stop.is_set():
             self._one_cycle()
             for _ in range(int(self.interval * 10)):
@@ -717,7 +718,7 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
     files_range: bool = False
     dirs_map: Dict[str, str] = {}
 
-    server_version = "BridgeServer/1.8"
+    server_version = "BridgeServer/1.9"
     sys_version = ""
 
     def _set_common_headers(self, status: int, content_type: str, extra: Optional[Dict[str, str]] = None):
@@ -865,7 +866,7 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
             except BrokenPipeError:
                 pass
             except Exception as e:
-                sys.stdout.write(f"[http] error sending range: {e}\\n")
+                sys.stdout.write(f"[http] error sending range: {e}\n")
             return
 
         headers = {
@@ -886,25 +887,25 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
         except BrokenPipeError:
             pass
         except Exception as e:
-            sys.stdout.write(f"[http] error sending file: {e}\\n")
+            sys.stdout.write(f"[http] error sending file: {e}\n")
 
     def do_GET(self):
         try:
             if self.path == "/":
                 self._set_common_headers(HTTPStatus.OK, "text/plain; charset=utf-8")
                 body = (
-                    "Cloudflared Quick Tunnel Bridge\\n"
-                    "Bridge Endpoints:\\n"
-                    "  GET /bridge/tunnel_url.json\\n"
-                    "  GET /bridge/tunnel_url.txt\\n"
-                    "  GET /health\\n"
-                    "\\n"
-                    "Static File Endpoints (read-only):\\n"
-                    "  GET /files/images/<path>\\n"
-                    "  GET /files/3d/<path>\\n"
-                    "  GET /files/mesh/<path>\\n"
-                    "  GET /files/video/<path>\\n"
-                    "  Optional listing: /files/<sub>?list=json\\n"
+                    "Cloudflared Quick Tunnel Bridge\n"
+                    "Bridge Endpoints:\n"
+                    "  GET /bridge/tunnel_url.json\n"
+                    "  GET /bridge/tunnel_url.txt\n"
+                    "  GET /health\n"
+                    "\n"
+                    "Static File Endpoints (read-only):\n"
+                    "  GET /files/images/<path>\n"
+                    "  GET /files/3d/<path>\n"
+                    "  GET /files/mesh/<path>\n"
+                    "  GET /files/video/<path>\n"
+                    "  Optional listing: /files/<sub>?list=json\n"
                 )
                 self.wfile.write(body.encode("utf-8"))
                 return
@@ -995,7 +996,7 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
                 pass
 
     def log_message(self, fmt, *args):
-        sys.stdout.write("[http] " + (fmt % args) + "\\n")
+        sys.stdout.write("[http] " + (fmt % args) + "\n")
 
 class HttpServerThread(threading.Thread):
     def __init__(self, host: str, port: int, handler_cls: type):
@@ -1095,7 +1096,7 @@ def parse_stage2_args(argv=None):
 
     # FTPS flag watcher options
     p.add_argument("--ftps-restart-flag", type=str, default=os.getenv("FTPS_RESTART_FLAG", ""), help="Filename in FTPS_DIR root to watch for cloudflared restart (e.g., restart.flag)")
-    p.add_argument("--ftps-stop-flag-name", type=str, default=os.getenv("FTPS_STOP_FLAG_NAME", "stop.flag"), help="Comfy stop flag filename in comfy subdir (default: stop.flag)")  # NEW
+    p.add_argument("--ftps-stop-flag-name", type=str, default=os.getenv("FTPS_STOP_FLAG_NAME", "stop.flag"), help="Comfy stop flag filename in comfy subdir (default: stop.flag)")
     p.add_argument("--ftps-check-interval", type=int, default=int(os.getenv("FTPS_CHECK_INTERVAL", "30")), help="Seconds between FTPS checks")
     p.add_argument("--ftps-flag-action", type=str, default=os.getenv("FTPS_FLAG_ACTION", "cloudflared"),
                    choices=["cloudflared", "comfy", "both"], help="Action when flags are found")
