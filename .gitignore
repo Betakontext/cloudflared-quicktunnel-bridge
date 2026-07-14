@@ -17,3 +17,7 @@ Thumbs.db
 
 # Cloudflared executable
 cloudflared-windows-amd64.exe
+
+# previous Versions
+cf_quicktunnel_writer00.py
+cf_quicktunnel_writer01.py
