@@ -1,7 +1,12 @@
-﻿# restart_comfyui.ps1
+﻿# restart_comfyui.ps1 (stale-lock resilient)
 # Starts ComfyUI if not running, or restarts it when invoked by your flag watcher.
 # Robust single-instance lock, deterministic kill, port wait, SQLite journal cleanup,
-# start, and dependency-free health check using raw TCP connect (no Invoke-WebRequest, no HttpClient).
+# start, and dependency-free health check using raw TCP connect.
+#
+# Enhancements over your baseline:
+# - Stale-lock resilience: auto-remove lock if age > ShortStaleSec (default 45s).
+# - One short retry if lock is fresh before exiting with code 2.
+# - Same port-holder logic as stop (optional aggressive clear).
 #
 # Exit codes:
 #   0 = success
@@ -12,6 +17,9 @@
 #   5 = start failed (process did not launch)
 #   6 = health check failed
 #   7 = unexpected error
+#
+# Usage:
+#   powershell -ExecutionPolicy Bypass -File ".\restart_comfyui.ps1"
 
 [CmdletBinding()]
 param(
@@ -32,8 +40,8 @@ param(
   # Health (TCP-based)
   [int]$HealthTimeoutSec = 120,
   [int]$HealthRetryDelaySec = 2,
-  [int]$HealthInitialDelaySec = 1,   # small backoff before first probe
-  [switch]$HttpConfirm = $false,     # optional: do a minimal HTTP GET after TCP is open
+  [int]$HealthInitialDelaySec = 1,
+  [switch]$HttpConfirm = $false,
 
   # Timeouts
   [int]$KillTimeoutSec = 20,
@@ -41,7 +49,13 @@ param(
 
   # Lock + Logging
   [string]$LockFile = ".restart.lock",
-  [string]$LogPrefix = "[comfy-restart]"
+  [string]$LogPrefix = "[comfy-restart]",
+
+  # Tuning flags
+  [int]$LockStaleSec = 180,           # legacy stale threshold (kept for compatibility)
+  [int]$ShortStaleSec = 45,           # new short stale threshold for auto-removal
+  [switch]$ForceUnlock = $false,
+  [switch]$AggressivePortFree = $true
 )
 
 # --------------- Utilities ---------------
@@ -55,7 +69,7 @@ function Write-Log {
 function Fail-And-Exit {
   param([int]$code, [string]$msg)
   Write-Log "ERROR: $msg"
-  exit $code
+  throw [System.Exception]::new("EXIT_CODE::$code")
 }
 
 function Resolve-MainPy {
@@ -67,7 +81,6 @@ function Resolve-MainPy {
 }
 
 function Get-ComfyProcesses {
-  # Match python.exe processes whose CommandLine references main.py or its containing directory
   param([string]$MainPyPath)
   try {
     $q = "SELECT ProcessId, CommandLine FROM Win32_Process WHERE Name='python.exe'"
@@ -97,10 +110,7 @@ function Stop-ComfyProcesses {
     Start-Sleep -Milliseconds 300
     $still = @()
     foreach ($ProcId in $ProcIds) {
-      try {
-        $p = Get-Process -Id $ProcId -ErrorAction SilentlyContinue
-        if ($p) { $still += $ProcId }
-      } catch {}
+      try { if (Get-Process -Id $ProcId -ErrorAction SilentlyContinue) { $still += $ProcId } } catch {}
     }
     if ($still.Count -eq 0) { return $true }
   }
@@ -115,21 +125,26 @@ function Stop-ComfyProcesses {
   return $true
 }
 
-function Test-PortFree {
+# netstat helpers (same semantics as stop script)
+function Netstat-LinesForPort {
   param([int]$p)
   try {
-    $line = & netstat -ano | Select-String -SimpleMatch (":" + $p)
-    return (-not $line)
-  } catch {
-    # Fallback using TcpClient
-    try {
-      $client = New-Object System.Net.Sockets.TcpClient
-      $iar = $client.BeginConnect("127.0.0.1", $p, $null, $null)
-      $ok = $iar.AsyncWaitHandle.WaitOne(200)
-      if ($ok -and $client.Connected) { $client.Close(); return $false }
-      $client.Close(); return $true
-    } catch { return $true }
+    return & netstat -ano | Select-String -Pattern (":$p\s")
+  } catch { return @() }
+}
+
+function Test-PortFree {
+  param([int]$p)
+  $lines = Netstat-LinesForPort -p $p
+  if (-not $lines -or $lines.Count -eq 0) { return $true }
+  foreach ($line in $lines) {
+    $cols = ($line -replace '\s+', ' ').Trim().Split(' ')
+    if ($cols.Count -ge 5) {
+      $state = $cols[$cols.Count - 2]
+      if ($state -match 'LISTENING|ESTABLISHED') { return $false }
+    }
   }
+  return $true
 }
 
 function Wait-PortFree {
@@ -141,6 +156,41 @@ function Wait-PortFree {
     Start-Sleep -Milliseconds 350
   }
   return (Test-PortFree -p $p)
+}
+
+function Get-PortHolderPids {
+  param([int]$p)
+  $pids = @()
+  $lines = Netstat-LinesForPort -p $p
+  foreach ($line in $lines) {
+    $cols = ($line -replace '\s+', ' ').Trim().Split(' ')
+    if ($cols.Count -ge 5) {
+      $state = $cols[$cols.Count - 2]
+      $pidStr = $cols[$cols.Count - 1]
+      if ($state -match 'LISTENING|ESTABLISHED' -and $pidStr -match '^\d+$') {
+        $pids += [int]$pidStr
+      }
+    }
+  }
+  return ($pids | Sort-Object -Unique)
+}
+
+function Kill-PortHolders {
+  param([int]$p, [switch]$Force)
+  $pids = Get-PortHolderPids -p $p
+  if (-not $pids -or $pids.Count -eq 0) {
+    Write-Log ("No explicit LISTEN/ESTABLISHED holders for " + $p + " found.")
+    return
+  }
+  Write-Log ("Killing port " + $p + " holders: " + ($pids -join ', ') + " (force=" + $Force.IsPresent + ")")
+  foreach ($pid in $pids) {
+    try {
+      if ($Force) { Stop-Process -Id $pid -Force -ErrorAction Stop }
+      else { Stop-Process -Id $pid -ErrorAction Stop }
+    } catch {
+      Write-Log ("WARNING: Failed to kill PID " + $pid + ": " + $_.Exception.Message)
+    }
+  }
 }
 
 function Cleanup-SQLite-Journals {
@@ -196,7 +246,7 @@ function Start-Comfy {
   $null = $proc.Start()
   Write-Log ("ComfyUI started. ProcId=" + $proc.Id + ", listen=" + $ListenAddr + ", port=" + $ListenPort)
 
-  # Background log pump (isolated; guarded)
+  # Background log pump (best-effort)
   try {
     Start-Job -ScriptBlock {
       param($hProcess)
@@ -285,6 +335,8 @@ function Http-Confirm {
 
 # --------------- Main ---------------
 
+$lockPath = $null
+$lockCreated = $false
 try {
   # Resolve and validate
   $MainPy = Resolve-MainPy -Root $ComfyRoot -Main $MainPy
@@ -292,37 +344,51 @@ try {
   if (-not (Test-Path $VenvPython)) { Fail-And-Exit 1 ("Venv Python not found: " + $VenvPython) }
   if (-not (Test-Path $MainPy)) { Fail-And-Exit 1 ("main.py not found: " + $MainPy) }
 
-  # Acquire lock
+  # Acquire/remove stale lock with resilience
   $lockPath = Join-Path $ComfyRoot $LockFile
   if (Test-Path $lockPath) {
     Write-Log ("Lock file exists at " + $lockPath + ". Checking staleness...")
-    $age = (Get-Date) - (Get-Item $lockPath).LastWriteTime
-    if ($age.TotalMinutes -gt 10) {
-      Write-Log "Lock older than 10 minutes; removing stale lock."
+    $ageSec = [int]((Get-Date) - (Get-Item $lockPath).LastWriteTime).TotalSeconds
+    if ($ForceUnlock) {
+      Write-Log "FORCE_UNLOCK set → removing existing lock."
+      Remove-Item $lockPath -ErrorAction SilentlyContinue
+    } elseif ($ageSec -gt $ShortStaleSec) {
+      Write-Log ("Lock age " + $ageSec + "s > " + $ShortStaleSec + "s → treating as stale. Removing.")
       Remove-Item $lockPath -ErrorAction SilentlyContinue
     } else {
-      Fail-And-Exit 2 ("Another restart in progress (lock: " + $lockPath + ")")
+      # brief debounce retry once
+      Write-Log ("Lock is fresh (age " + $ageSec + "s ≤ " + $ShortStaleSec + "s). Waiting 2s and retrying once...")
+      Start-Sleep -Seconds 2
+      if (Test-Path $lockPath) {
+        $ageSec2 = [int]((Get-Date) - (Get-Item $lockPath).LastWriteTime).TotalSeconds
+        if ($ageSec2 -gt $ShortStaleSec) {
+          Write-Log ("After wait, lock age " + $ageSec2 + "s > " + $ShortStaleSec + "s → removing.")
+          Remove-Item $lockPath -ErrorAction SilentlyContinue
+        } else {
+          Fail-And-Exit 2 ("Another restart in progress (lock: " + $lockPath + ", age " + $ageSec2 + "s)")
+        }
+      }
     }
   }
   New-Item -ItemType File -Path $lockPath -Force | Out-Null
-  $script:lockCreated = $true
+  $lockCreated = $true
   Write-Log ("Acquired lock: " + $lockPath)
 
-  Register-EngineEvent PowerShell.Exiting -Action {
-    try {
-      if ($script:lockCreated -and (Test-Path $lockPath)) { Remove-Item $lockPath -ErrorAction SilentlyContinue }
-    } catch {}
-  } | Out-Null
-
+  # Detect existing Comfy processes
   $existing = Get-ComfyProcesses -MainPyPath $MainPy
-
   if ($existing.Count -gt 0) {
-    # Restart
     $procIds = ($existing | Select-Object -ExpandProperty ProcessId)
     if (-not (Stop-ComfyProcesses -ProcIds $procIds -TimeoutSec $KillTimeoutSec)) {
       Fail-And-Exit 3 "Failed to stop some ComfyUI processes."
     }
-    if (-not (Wait-PortFree -p $Port -TimeoutSec $PortWaitTimeoutSec)) {
+    $portFree = Wait-PortFree -p $Port -TimeoutSec $PortWaitTimeoutSec
+    if (-not $portFree -and $AggressivePortFree) {
+      Write-Log "Port still not free → killing explicit LISTEN/ESTABLISHED holders and retrying shortly."
+      Kill-PortHolders -p $Port -Force
+      Start-Sleep -Seconds 2
+      $portFree = Test-PortFree -p $Port
+    }
+    if (-not $portFree) {
       Fail-And-Exit 4 ("Port " + $Port + " did not free within " + $PortWaitTimeoutSec + "s.")
     }
     Cleanup-SQLite-Journals -Root $ComfyRoot
@@ -332,9 +398,15 @@ try {
       Fail-And-Exit 5 ("Failed to start ComfyUI: " + $_.Exception.Message)
     }
   } else {
-    # Start-if-not-running
     Write-Log "No existing ComfyUI processes found."
-    if (-not (Wait-PortFree -p $Port -TimeoutSec $PortWaitTimeoutSec)) {
+    $portFree = Wait-PortFree -p $Port -TimeoutSec $PortWaitTimeoutSec
+    if (-not $portFree -and $AggressivePortFree) {
+      Write-Log "Port still not free → killing explicit LISTEN/ESTABLISHED holders and retrying shortly."
+      Kill-PortHolders -p $Port -Force
+      Start-Sleep -Seconds 2
+      $portFree = Test-PortFree -p $Port
+    }
+    if (-not $portFree) {
       Fail-And-Exit 4 ("Port " + $Port + " did not free within " + $PortWaitTimeoutSec + "s.")
     }
     Cleanup-SQLite-Journals -Root $ComfyRoot
@@ -355,7 +427,7 @@ try {
 
   if ($HttpConfirm) {
     if (-not (Http-Confirm -TcpHost $tcpHost -Port $Port -Path "/")) {
-      Write-Log "TCP ready but HTTP confirm did not return 200–499; proceeding anyway (HttpConfirm disabled by default)."
+      Write-Log "TCP ready but HTTP confirm did not return 200–499; proceeding anyway."
     } else {
       Write-Log "HTTP confirm succeeded."
     }
@@ -363,14 +435,31 @@ try {
 
   Write-Log ("ComfyUI is healthy (TCP) at " + $tcpHost + ":" + $Port)
 
-  # Success → release lock
-  if (Test-Path $lockPath) { Remove-Item $lockPath -ErrorAction SilentlyContinue }
-  $script:lockCreated = $false
+  # Success
+  if ($lockCreated -and (Test-Path $lockPath)) { Remove-Item $lockPath -ErrorAction SilentlyContinue }
+  $lockCreated = $false
   exit 0
 
 } catch {
+  # Parse our Fail-And-Exit code if present
+  $code = 7
+  $msg = $_.Exception.Message
+  if ($msg -like "EXIT_CODE::*") {
+    try { $code = [int]($msg.Split("::")[-1]) } catch {}
+  } elseif ($msg -like "*EXIT_CODE::*") {
+    try { $code = [int]($msg.Substring($msg.LastIndexOf("EXIT_CODE::") + 10)) } catch {}
+  } else {
+    # keep default
+  }
+  Write-Log ("Aborting with code " + $code + ". Reason: " + $msg)
+  exit $code
+
+} finally {
+  # Always cleanup lock to prevent stuck lifecycle
   try {
-    if ($script:lockCreated -and (Test-Path $lockPath)) { Remove-Item $lockPath -ErrorAction SilentlyContinue }
+    if ($lockCreated -and (Test-Path $lockPath)) {
+      Remove-Item $lockPath -ErrorAction SilentlyContinue
+      Write-Log ("Lock removed in finally: " + $lockPath)
+    }
   } catch {}
-  Fail-And-Exit 7 ("Unhandled exception: " + $_.Exception.Message)
 }
