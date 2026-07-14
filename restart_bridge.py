@@ -2,25 +2,25 @@
 # -*- coding: utf-8 -*-
 """
 restart_bridge.py
-Trigger a soft restart of the Bridge tunnel by uploading a restart flag to the FTPS bridge directory.
+Trigger a soft restart of the Bridge tunnel by uploading 'restart.flag' to the FTPS bridge directory.
 
 - Uses stdlib-only FTPS (ftplib.FTP_TLS).
-- Loads .env with same semantics as the Bridge script.
+- Loads .env with the same semantics as the Bridge script (explicit --env-file or auto-discover).
 - Retries with exponential backoff.
-- Writes a small local file as the uploaded flag content for clarity and traceability.
+- Writes a small local file as the uploaded flag content for traceability.
 
 Env keys (from .env):
   FTPS_HOST, FTPS_USER, FTPS_PASS, FTPS_DIR
 Optional:
-  FTPS_RESTART_FLAG (default: restart.flag)
+  FTPS_RETRIES (default 5), FTPS_TIMEOUT (default 25)
 
 CLI:
-  --env-file         Path to .env (if omitted, auto-discover next to script, then CWD)
+  --env-file         Path to .env file (if omitted, auto-discover next to script, then CWD)
   --no-auto-env      Disable auto-discovery
-  --flag-name        Override flag filename (default: from FTPS_RESTART_FLAG or 'restart.flag')
+  --flag-name        Override flag filename (default: 'restart.flag')
   --message          Add a note into the flag file content
-  --retries          Upload retries (default: 5)
-  --ftps-timeout     FTPS connect timeout seconds (default: 25)
+  --retries          Upload retries (default: env FTPS_RETRIES or 5)
+  --ftps-timeout     FTPS connect timeout seconds (default: env FTPS_TIMEOUT or 25)
 
 Exit codes:
   0 success
@@ -171,7 +171,7 @@ def parse_args(argv=None):
     p = argparse.ArgumentParser(description="Trigger Bridge tunnel restart by uploading restart.flag to FTPS_DIR")
     p.add_argument("--env-file", type=str, default="", help="Path to .env file to load before execution")
     p.add_argument("--no-auto-env", action="store_true", help="Disable .env auto-discovery")
-    p.add_argument("--flag-name", type=str, default="", help="Override flag filename (default: FTPS_RESTART_FLAG or 'restart.flag')")
+    p.add_argument("--flag-name", type=str, default="restart.flag", help="Flag filename to upload (default: restart.flag)")
     p.add_argument("--message", type=str, default="", help="Optional note included in flag content")
     p.add_argument("--retries", type=int, default=int(os.getenv("FTPS_RETRIES", "5")), help="Upload retries")
     p.add_argument("--ftps-timeout", type=float, default=float(os.getenv("FTPS_TIMEOUT", "25")), help="FTPS timeout seconds")
@@ -200,7 +200,7 @@ def main():
     user = os.getenv("FTPS_USER", "").strip()
     pwd = os.getenv("FTPS_PASS", "")
     remote_dir = os.getenv("FTPS_DIR", "").strip()
-    flag_name = (args.flag_name or os.getenv("FTPS_RESTART_FLAG", "restart.flag")).strip() or "restart.flag"
+    flag_name = (args.flag_name or "restart.flag").strip() or "restart.flag"
 
     # Validate
     missing = []
@@ -214,7 +214,7 @@ def main():
 
     # Create local flag file content
     note = args.message.strip()
-    content = f"restart requested at {utc_now_iso()}"
+    content = f"bridge restart requested at {utc_now_iso()}"
     if note:
         content += f"\nmessage: {note}"
     content_bytes = (content + "\n").encode("utf-8")
