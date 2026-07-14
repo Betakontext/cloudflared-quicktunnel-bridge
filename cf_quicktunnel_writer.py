@@ -5,15 +5,12 @@ Cloudflared Quick Tunnel URL Writer with:
 - built-in stdlib HTTP pull endpoint (for LAN pull)
 - optional FTPS upload to stable public web space (Greensta) for Internet pull
 - static, read-only file server for selected ComfyUI output subfolders
-- optional health check and FTPS flag-triggered restart per instance
+- optional health check and FTPS flag-triggered soft restart per instance
 - .env support (stdlib-only) for credentials and configuration
 
-Why:
-- Quick Tunnels rotate hostnames. To provide a stable pull URL for slAIdshow,
-  we additionally upload tunnel_url.json/txt to a fixed HTTPS location on your web host.
-- This bypasses CGNAT and avoids router port forwards.
-- Additionally, we expose selected ComfyUI output directories via the same server
-  so you can fetch generated 3D/mesh/video/image artifacts from other devices (and over the tunnel).
+This version implements a SOFT RESTART:
+- FTPS flag or HealthWatcher no longer stop the whole app.
+- They only request a cloudflared subprocess restart (HTTP server keeps running).
 
 Endpoints served locally (optional for LAN):
   GET /bridge/tunnel_url.json
@@ -70,45 +67,11 @@ FTPS upload (optional, stdlib-only via ftplib.FTP_TLS):
     FTPS_RESTART_FLAG=restart.flag        # optional; enable FTPS flag watcher when FTPS_ENABLE and this set
     FTPS_CHECK_INTERVAL=30
 
-- Values may be quoted: KEY="value with spaces"
-
 Priority:
 - CLI arguments override environment variables.
 - .env is loaded into os.environ before full CLI parsing.
 - If --env-file is omitted, the loader auto-discovers .env next to the script,
   then in current working directory.
-
-Typical start:
-
-with .env in the same directory:
-
-    python cf_quicktunnel_writer.py
-
-without .env:
-
-  python cf_quicktunnel_writer.py ^
-    --cloudflared "cloudflared-windows-amd64.exe" ^
-    --comfy-url "http://127.0.0.1:8188" ^
-    --out-dir "C:\Users\Administrator\Documents\Arbeiten\0000_DEV\cloudflared-quicktunnel-bridge\bridge_output" ^
-    --http-host 0.0.0.0 --http-port 8799 ^
-    --files-enable --files-root "C:\Users\...\ComfyUI\output" ^
-    --files-3d-dir "C:\Users\...\ComfyUI\output\3d" ^
-    --files-mesh-dir "C:\Users\...\ComfyUI\output\mesh" ^
-    --files-video-dir "C:\Users\...\ComfyUI\output\video" ^
-    --files-index --files-range ^
-    --ftps-enable ^
-    --ftps-host "*****" ^
-    --ftps-user "********" ^
-    --ftps-dir "*****" ^
-    --health-target "http://127.0.0.1:8188" ^
-    --health-interval 15 --health-threshold 3 ^
-    --ftps-restart-flag "restart.flag" --ftps-check-interval 30
-
-Security tips:
-- Do NOT commit credentials. Prefer the .env file excluded via .gitignore, or use process env vars.
-- FTPS uses TLS but still verify you trust the hosting.
-- Static file endpoints are read-only and directory-traversal safe. Consider keeping FILES_ENABLE=false
-  if you do not need public file access, or protect the tunnel with Cloudflare Access.
 
 Test checklist:
 1) Start cloudflared binary is reachable (or specify --cloudflared).
@@ -120,7 +83,7 @@ Test checklist:
    - curl http://127.0.0.1:8799/files/images?list=json
    - curl -I http://127.0.0.1:8799/files/images/sample.png
 4) Enable FTPS and check uploads on URL change. Ensure remote path is correct.
-5) Try with .env only (no CLI), then override one value via CLI to confirm priority.
+5) Upload restart.flag to your configured FTPS_DIR and confirm only cloudflared restarts, HTTP server stays up.
 """
 
 import argparse
@@ -146,18 +109,11 @@ TRYCF_RE = re.compile(r"https://[a-z0-9\-]+\.trycloudflare\.com", re.IGNORECASE)
 # ========== .env loader (stdlib-only) ==========
 
 def _strip_quotes(value: str) -> str:
-    """Strip wrapping single or double quotes if present."""
     if (value.startswith('"') and value.endswith('"')) or (value.startswith("'") and value.endswith("'")):
         return value[1:-1]
     return value
 
 def load_env_file(path: str, overwrite: bool = False) -> int:
-    """
-    Load KEY=VALUE pairs from a .env file into os.environ.
-    - Supports comments (#), blank lines, quoted values.
-    - overwrite=False means: do not override existing environment keys.
-    Returns number of keys set/updated.
-    """
     set_count = 0
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -169,8 +125,7 @@ def load_env_file(path: str, overwrite: bool = False) -> int:
                     continue
                 key, val = line.split("=", 1)
                 key = key.strip()
-                val = val.strip()
-                val = _strip_quotes(val)
+                val = _strip_quotes(val.strip())
                 if not key:
                     continue
                 if overwrite or (key not in os.environ):
@@ -184,14 +139,7 @@ def load_env_file(path: str, overwrite: bool = False) -> int:
         return 0
 
 def auto_discover_env_file(script_dir: str, cwd: str) -> Optional[str]:
-    """
-    Returns the first existing .env path among:
-      1) script_dir/.env
-      2) cwd/.env (if different from script_dir)
-    """
-    candidates = [
-        os.path.join(script_dir, ".env"),
-    ]
+    candidates = [os.path.join(script_dir, ".env")]
     if os.path.abspath(cwd) != os.path.abspath(script_dir):
         candidates.append(os.path.join(cwd, ".env"))
     for p in candidates:
@@ -208,12 +156,10 @@ def utc_now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 def http_date(ts: float) -> str:
-    """Return HTTP-date string for Last-Modified header."""
     from email.utils import formatdate
     return formatdate(timeval=ts, usegmt=True)
 
 def atomic_write(path: str, data: bytes):
-    """Atomically write bytes to a file path (safe replace)."""
     d = os.path.dirname(os.path.abspath(path)) or "."
     base = os.path.basename(path)
     fd, tmppath = tempfile.mkstemp(prefix=base + ".", suffix=".tmp", dir=d)
@@ -244,27 +190,7 @@ def read_text_file(path: str) -> Optional[str]:
     except Exception:
         return None
 
-def parse_url_parts(url: str) -> Tuple[str, str, int]:
-    """Parse scheme, host, port with stdlib only."""
-    scheme = "https" if url.lower().startswith("https://") else "http"
-    rest = url.split("://", 1)[1] if "://" in url else url
-    hostport = rest.split("/", 1)[0]
-    if ":" in hostport:
-        host, port_s = hostport.rsplit(":", 1)
-        try:
-            port = int(port_s)
-        except ValueError:
-            port = 443 if scheme == "https" else 80
-    else:
-        host = hostport
-        port = 443 if scheme == "https" else 80
-    return scheme, host, port
-
 def safe_join(base_dir: str, rel_path: str) -> Optional[str]:
-    """
-    Safely join base_dir with a user-supplied relative path.
-    Prevent directory traversal by ensuring result stays within base_dir.
-    """
     rel_path = rel_path.split("?", 1)[0].split("#", 1)[0]
     rel_path = rel_path.lstrip("/\\")
     norm = os.path.normpath(os.path.join(base_dir, rel_path))
@@ -275,10 +201,6 @@ def safe_join(base_dir: str, rel_path: str) -> Optional[str]:
     return norm_abs
 
 def guess_mime_type(filename: str) -> str:
-    """
-    Best-effort MIME type mapping for common 3D/video/mesh/image formats.
-    Falls back to application/octet-stream.
-    """
     ext = os.path.splitext(filename.lower())[1]
     if ext in (".mp4",):
         return "video/mp4"
@@ -322,14 +244,11 @@ def guess_mime_type(filename: str) -> str:
     return "application/octet-stream"
 
 # ========== FTPS Upload (stdlib: ftplib) ==========
-from ftplib import FTP_TLS, error_perm, all_errors as ftplib_errors
+from ftplib import FTP_TLS, all_errors as ftplib_errors
 from contextlib import contextmanager
 
 @contextmanager
 def ftps_connect(host: str, user: str, password: str, timeout: float = 25.0):
-    """
-    Connect/login to FTPS (explicit TLS). Performs PROT P to encrypt data channel.
-    """
     ftps = FTP_TLS()
     ftps.connect(host=host, timeout=timeout)
     ftps.auth()
@@ -347,9 +266,6 @@ def ftps_connect(host: str, user: str, password: str, timeout: float = 25.0):
                 pass
 
 def _ftps_mkdirs(ftps: FTP_TLS, remote_dir: str):
-    """
-    Create remote_dir and parents if missing. Tries to CWD stepwise and MKD on failure.
-    """
     if not remote_dir or remote_dir == "/":
         return
     parts = [p for p in remote_dir.strip("/").split("/") if p]
@@ -372,10 +288,6 @@ def _ftps_mkdirs(ftps: FTP_TLS, remote_dir: str):
             ftps.cwd(path_so_far)
 
 def ftps_upload_file(host: str, user: str, password: str, local_path: str, remote_dir: str, remote_filename: Optional[str] = None, timeout: float = 25.0):
-    """
-    Upload local_path to host:/remote_dir/remote_filename via FTPS with binary transfer.
-    Ensures remote_dir exists (best-effort).
-    """
     if remote_filename is None:
         remote_filename = os.path.basename(local_path)
     with ftps_connect(host, user, password, timeout=timeout) as ftps:
@@ -386,9 +298,6 @@ def ftps_upload_file(host: str, user: str, password: str, local_path: str, remot
             ftps.storbinary(f"STOR {remote_filename}", lf)
 
 def upload_with_retries(host: str, user: str, password: str, local_path: str, remote_dir: str, remote_filename: Optional[str] = None, retries: int = 5, base_delay: float = 1.0):
-    """
-    Retry FTPS upload with exponential backoff.
-    """
     attempt = 0
     last_exc = None
     while attempt < retries:
@@ -405,11 +314,15 @@ def upload_with_retries(host: str, user: str, password: str, local_path: str, re
     print(f"[ftps] upload permanently failed: {last_exc}", flush=True)
     return False
 
-# ========== Cloudflared writer ==========
+# ========== Cloudflared writer with SOFT RESTART ==========
 
 class TunnelWriter:
     """
     Manage cloudflared subprocess, detect public URL, persist JSON/TXT, and optionally FTPS-upload.
+
+    Soft restart semantics:
+    - stop_evt: ends the entire writer (used on process shutdown SIGINT/SIGTERM)
+    - restart_evt: request to restart only cloudflared subprocess (health/flag watchers)
     """
 
     def __init__(self, cf_bin: str, comfy_url: str, out_dir: str, protocol: str = "http2",
@@ -420,7 +333,10 @@ class TunnelWriter:
         self.out_dir = out_dir
         self.protocol = protocol
         self.proc: Optional[subprocess.Popen] = None
-        self.stop_evt = threading.Event()
+
+        self.stop_evt = threading.Event()     # full stop (app exit)
+        self.restart_evt = threading.Event()  # soft restart request
+
         self.current_url = ""
         self.backoff = 2.0
 
@@ -436,8 +352,9 @@ class TunnelWriter:
         self.json_path = os.path.join(self.out_dir, "tunnel_url.json")
         self.txt_path = os.path.join(self.out_dir, "tunnel_url.txt")
 
+    # -------- persistence / upload --------
+
     def write_urls_local(self, url: str):
-        """Persist URL to .json and .txt atomically (local)."""
         payload = {"url": url, "updated_at": utc_now_iso()}
         data_json = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         data_txt = (url or "").encode("utf-8")
@@ -446,7 +363,6 @@ class TunnelWriter:
         print(f"[writer] wrote {self.json_path} and {self.txt_path}", flush=True)
 
     def upload_remote_if_enabled(self):
-        """Upload local JSON and TXT to FTPS target when enabled."""
         if not self.ftps_enable:
             return
         if not (self.ftps_host and self.ftps_user and self.ftps_pass and self.ftps_dir):
@@ -458,6 +374,36 @@ class TunnelWriter:
         upload_with_retries(self.ftps_host, self.ftps_user, self.ftps_pass,
                             self.txt_path, self.ftps_dir, remote_filename="tunnel_url.txt",
                             retries=self.ftps_retries)
+
+    # -------- lifecycle control --------
+
+    def request_restart(self):
+        """
+        Soft-restart: terminate current cloudflared process and set restart flag.
+        The run_forever loop will respawn cloudflared without stopping the HTTP server.
+        """
+        print("[writer] soft restart requested", flush=True)
+        self.restart_evt.set()
+        try:
+            if self.proc and self.proc.poll() is None:
+                print("[writer] terminating cloudflared for restart", flush=True)
+                self.proc.terminate()
+        except Exception as e:
+            print(f"[writer] terminate error (ignored): {e}", flush=True)
+
+    def stop(self):
+        """
+        Full stop: end loop and terminate cloudflared.
+        """
+        print("[writer] full stop requested", flush=True)
+        self.stop_evt.set()
+        try:
+            if self.proc and self.proc.poll() is None:
+                self.proc.terminate()
+        except Exception:
+            pass
+
+    # -------- run loop --------
 
     def run_once(self):
         cmd = [
@@ -481,12 +427,16 @@ class TunnelWriter:
             )
         except Exception as e:
             print(f"[cloudflared] spawn error: {e}", flush=True)
-            return False
+            return
 
         assert self.proc.stdout is not None
         try:
             for line in self.proc.stdout:
                 if self.stop_evt.is_set():
+                    break
+                # If a restart was requested while streaming logs, break to end run_once quickly
+                if self.restart_evt.is_set():
+                    print("[cloudflared] log reader noticed restart request", flush=True)
                     break
                 line = line.rstrip("\r\n")
                 print(f"[cloudflared] {line}", flush=True)
@@ -504,25 +454,46 @@ class TunnelWriter:
         except Exception as e:
             print(f"[cloudflared] read error: {e}", flush=True)
 
+        # Ensure process ends when restart requested
+        if self.restart_evt.is_set():
+            try:
+                if self.proc and self.proc.poll() is None:
+                    self.proc.terminate()
+            except Exception:
+                pass
+
         try:
             rc = self.proc.wait(timeout=2)
         except Exception:
             rc = None
         print(f"[cloudflared] exited rc={rc}", flush=True)
-        return True
 
     def run_forever(self):
+        print("[writer] run_forever started", flush=True)
         while not self.stop_evt.is_set():
-            _ = self.run_once()
+            # Clear restart flag BEFORE starting a run
+            if self.restart_evt.is_set():
+                print("[writer] clearing pending restart flag before spawn", flush=True)
+                self.restart_evt.clear()
+
+            self.run_once()
             if self.stop_evt.is_set():
                 break
-            # Backoff and retry on crash/failure
+
+            # If a restart was requested during run_once, honor it immediately (no backoff)
+            if self.restart_evt.is_set():
+                print("[writer] immediate respawn due to restart request", flush=True)
+                # loop continues to next iteration; restart_evt will be cleared at top
+                continue
+
+            # Otherwise, exponential backoff on natural crashes/exit
             t = self.backoff
             self.backoff = min(self.backoff * 1.5, 30.0)
             for _ in range(int(t / 0.1)):
-                if self.stop_evt.is_set():
+                if self.stop_evt.is_set() or self.restart_evt.is_set():
                     break
                 time.sleep(0.1)
+        print("[writer] run_forever exiting", flush=True)
 
     def is_running(self) -> bool:
         try:
@@ -530,19 +501,12 @@ class TunnelWriter:
         except Exception:
             return False
 
-    def stop(self):
-        self.stop_evt.set()
-        try:
-            if self.proc and self.proc.poll() is None:
-                self.proc.terminate()
-        except Exception:
-            pass
-
 # ========== Watchers (Health + FTPS flag) ==========
 
 class HealthWatcher(threading.Thread):
     """
-    Periodically checks a target HTTP URL and restarts the tunnel if it seems unhealthy.
+    Periodically checks a target HTTP URL and requests a soft restart
+    if it seems unhealthy for N consecutive checks.
     """
     def __init__(self, target_url: str, interval: int, threshold: int, tw: TunnelWriter):
         super().__init__(daemon=True)
@@ -561,7 +525,7 @@ class HealthWatcher(threading.Thread):
             req = urllib.request.Request(self.target_url, method="GET")
             with urllib.request.urlopen(req, timeout=8) as resp:
                 code = getattr(resp, "status", 200)
-                return 200 <= int(code) < 500  # consider 5xx as failure
+                return 200 <= int(code) < 500  # 5xx => failure
         except Exception as e:
             sys.stdout.write(f"[health] check error: {e}\n")
             return False
@@ -577,12 +541,11 @@ class HealthWatcher(threading.Thread):
             else:
                 self._fails += 1
                 if self._fails >= self.threshold:
-                    sys.stdout.write("[health] threshold reached -> restarting cloudflared\n")
+                    sys.stdout.write("[health] threshold reached -> soft restart cloudflared\n")
                     try:
-                        self.tw.stop()
+                        self.tw.request_restart()
                     except Exception:
                         pass
-                    # give it a moment; the main loop will respawn due to run_forever()
                     self._fails = 0
             for _ in range(int(self.interval * 10)):
                 if self._stop.is_set():
@@ -595,7 +558,7 @@ class HealthWatcher(threading.Thread):
 class FtpsFlagWatcher(threading.Thread):
     """
     Periodically connects to FTPS and checks for a restart flag file.
-    If found, removes it and restarts the tunnel.
+    If found, removes it and requests a soft restart.
     """
     def __init__(self, enabled: bool, host: str, user: str, password: str, remote_dir: str,
                  flag_name: str, interval: int, tw: TunnelWriter):
@@ -620,20 +583,20 @@ class FtpsFlagWatcher(threading.Thread):
                 except Exception:
                     _ftps_mkdirs(ftps, self.remote_dir)
                     ftps.cwd(self.remote_dir)
-                # Try to list and detect the flag file
+                # List and detect the flag file
                 names: List[str] = []
                 try:
                     names = ftps.nlst()
                 except Exception as e:
                     sys.stdout.write(f"[flag] list error: {e}\n")
                 if self.flag_name in names:
-                    sys.stdout.write(f"[flag] detected {self.flag_name} -> removing and restarting\n")
+                    sys.stdout.write(f"[flag] detected {self.flag_name} -> removing and soft-restarting\n")
                     try:
                         ftps.delete(self.flag_name)
                     except Exception as e:
                         sys.stdout.write(f"[flag] delete error: {e}\n")
                     try:
-                        self.tw.stop()
+                        self.tw.request_restart()
                     except Exception:
                         pass
         except Exception as e:
@@ -671,20 +634,18 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
         - Optional listing: /files/<sub>?list=json
     """
 
-    # Bridge config (populated from main)
     out_dir: str = "."
     json_path: str = "tunnel_url.json"
     txt_path: str = "tunnel_url.txt"
     enable_cors: bool = False
     writer_ref: Optional[TunnelWriter] = None
 
-    # Files config (populated from main)
     files_enable: bool = False
     files_index: bool = False
     files_range: bool = False
-    dirs_map: Dict[str, str] = {}  # sub -> abs dir path
+    dirs_map: Dict[str, str] = {}
 
-    server_version = "BridgeServer/1.4"
+    server_version = "BridgeServer/1.5"
     sys_version = ""
 
     def _set_common_headers(self, status: int, content_type: str, extra: Optional[Dict[str, str]] = None):
@@ -708,25 +669,18 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
             self.send_header("Access-Control-Allow-Headers", "Content-Type, Range")
         self.end_headers()
 
-    # -------- Helpers for static files --------
-
     def _parse_files_request(self) -> Optional[Tuple[str, str, Dict[str, str]]]:
-        """
-        Parse /files/<sub>/<relpath>?query...
-        Returns (sub, relpath, query_params) or None if not a files route.
-        """
         if not self.path.startswith("/files/"):
             return None
         if "?" in self.path:
             path_part, query = self.path.split("?", 1)
         else:
             path_part, query = self.path, ""
-        parts = path_part.rstrip("/").split("/", 3)  # ["", "files", "<sub>", "<rel...>"]
+        parts = path_part.rstrip("/").split("/", 3)
         if len(parts) < 3:
             return None
         sub = parts[2] if len(parts) >= 3 else ""
-        rel = parts[3] if len(parts) >= 4 else ""  # may be empty for directory index
-        # Parse simple query params
+        rel = parts[3] if len(parts) >= 4 else ""
         qparams: Dict[str, str] = {}
         if query:
             for kv in query.split("&"):
@@ -740,10 +694,6 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
         return (sub, rel, qparams)
 
     def _list_directory_json(self, base_dir: str, rel_path: str) -> bytes:
-        """
-        Return a JSON listing for a directory.
-        Structure: { "path": "<rel>", "items": [ { "name": "...", "type": "file|dir", "size": n, "mtime": "ISO" }, ... ] }
-        """
         target = safe_join(base_dir, rel_path or ".")
         if target is None:
             return json.dumps({"error": "forbidden"}).encode("utf-8")
@@ -759,7 +709,7 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
                             "name": entry.name,
                             "type": "dir" if entry.is_dir() else "file",
                             "size": int(st.st_size),
-                            "mtime": utc_now_iso() if not st.st_mtime else datetime.fromtimestamp(st.st_mtime, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                            "mtime": datetime.fromtimestamp(st.st_mtime, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                         })
                     except Exception:
                         items.append({"name": entry.name, "type": "unknown"})
@@ -768,12 +718,6 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
         return json.dumps({"path": rel_path, "items": items}, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
     def _send_file_with_optional_range(self, fs_path: str, mime: str):
-        """
-        Serve a file with support for:
-         - ETag (weak) and Last-Modified
-         - Conditional If-None-Match/If-Modified-Since
-         - Byte range requests if self.files_range is True and Range header present
-        """
         try:
             st = os.stat(fs_path)
         except FileNotFoundError:
@@ -872,8 +816,6 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
         except Exception as e:
             sys.stdout.write(f"[http] error sending file: {e}\n")
 
-    # -------- Main request handler --------
-
     def do_GET(self):
         try:
             if self.path == "/":
@@ -947,7 +889,6 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
                     self.wfile.write(b'{"error":"subdir_not_configured"}')
                     return
 
-                # Listing?
                 if self.files_index and (rel == "" or self.path.rstrip("/").endswith(f"/files/{sub}") or q.get("list", "").lower() == "json"):
                     payload = self._list_directory_json(base_dir, rel)
                     self._set_common_headers(HTTPStatus.OK, "application/json", {"Cache-Control": "no-cache"})
@@ -1041,15 +982,13 @@ def find_default_cloudflared(script_path: str) -> str:
 # ========== Main ==========
 
 def parse_stage1_args(argv=None):
-    """Parse minimal args to control .env loading."""
     p = argparse.ArgumentParser(add_help=False)
     p.add_argument("--env-file", type=str, default="", help="Path to .env file to load before full parsing")
     p.add_argument("--no-auto-env", action="store_true", help="Disable auto-discovery of .env")
     return p.parse_known_args(argv)
 
 def parse_stage2_args(argv=None):
-    """Full parser using environment defaults (possibly populated from .env)."""
-    p = argparse.ArgumentParser(description="Cloudflared Quick Tunnel URL Writer with LAN HTTP endpoint, optional FTPS upload, static file serving, health checks, FTPS restart flag, and .env support")
+    p = argparse.ArgumentParser(description="Cloudflared Quick Tunnel URL Writer with LAN HTTP endpoint, optional FTPS upload, static file serving, health checks, FTPS soft restart flag, and .env support")
     # Primary settings
     p.add_argument("--cloudflared", type=str, default=os.getenv("CLOUDFLARED", ""), help="Path to cloudflared binary (auto-discover if empty or 'cloudflared')")
     p.add_argument("--comfy-url", type=str, default=os.getenv("COMFY_URL", "http://127.0.0.1:8188"), help="Local URL to expose via tunnel (e.g., ComfyUI or this bridge)")
@@ -1095,11 +1034,6 @@ def parse_stage2_args(argv=None):
     return p.parse_args(argv)
 
 def _resolve_dir(path_value: str, root_fallback: str, sub: str, script_dir: str) -> str:
-    """
-    Resolve directory path:
-      - If path_value set: resolve relative to script_dir or as absolute if given.
-      - Else: use root_fallback/<sub>
-    """
     if path_value:
         p = path_value
         if not os.path.isabs(p):
@@ -1111,7 +1045,7 @@ def _resolve_dir(path_value: str, root_fallback: str, sub: str, script_dir: str)
     return os.path.join(base, sub)
 
 def main():
-    # Stage 1: early parse for .env loading controls
+    # Stage 1: early parse for .env loading
     stage1_args, remaining = parse_stage1_args()
 
     # Load .env if provided, else auto-discover unless disabled
@@ -1134,10 +1068,10 @@ def main():
     else:
         print("[env] auto-discovery disabled", flush=True)
 
-    # Stage 2: full parse with defaults from os.environ (potentially populated)
+    # Stage 2: full parse
     args = parse_stage2_args(remaining)
 
-    # Resolve cloudflared binary and out dir
+    # Resolve binaries and dirs
     cf_bin = (args.cloudflared or "").strip() or find_default_cloudflared(__file__)
     out_dir = (args.out_dir or "").strip() or (os.path.dirname(os.path.abspath(__file__)) or ".")
 
@@ -1146,15 +1080,14 @@ def main():
     if files_root and not os.path.isabs(files_root):
         files_root = os.path.abspath(os.path.join(script_dir, files_root))
 
-    dir_images = (args.files_images_dir or "").strip()
-    if not dir_images:
-        dir_images = files_root or os.path.join(script_dir, "output")  # default: FILES_ROOT or ./output
+    dir_images = (args.files_images_dir or "").strip() or (files_root or os.path.join(script_dir, "output"))
+    if not os.path.isabs(dir_images):
+        dir_images = os.path.abspath(os.path.join(script_dir, dir_images))
 
     dir_3d = _resolve_dir((args.files_3d_dir or "").strip(), files_root, "3d", script_dir)
     dir_mesh = _resolve_dir((args.files_mesh_dir or "").strip(), files_root, "mesh", script_dir)
     dir_video = _resolve_dir((args.files_video_dir or "").strip(), files_root, "video", script_dir)
 
-    # Mask sensitive info for logs
     masked_pass = "****" if args.ftps_pass else ""
 
     print(
@@ -1201,14 +1134,13 @@ def main():
         ftps_retries=args.ftps_retries,
     )
 
-    # Prepare HTTP handler class with shared config
+    # Prepare HTTP handler shared config
     BridgeRequestHandler.out_dir = out_dir
     BridgeRequestHandler.json_path = os.path.join(out_dir, "tunnel_url.json")
     BridgeRequestHandler.txt_path = os.path.join(out_dir, "tunnel_url.txt")
     BridgeRequestHandler.enable_cors = bool(args.http_cors)
     BridgeRequestHandler.writer_ref = tw
 
-    # Static files setup
     BridgeRequestHandler.files_enable = bool(args.files_enable)
     BridgeRequestHandler.files_index = bool(args.files_index)
     BridgeRequestHandler.files_range = bool(args.files_range)
@@ -1219,10 +1151,9 @@ def main():
         "video": dir_video,
     }
 
-    # Create out_dir if missing
     os.makedirs(out_dir, exist_ok=True)
 
-    # Start HTTP server thread
+    # Start HTTP server
     http_thread = HttpServerThread(args.http_host, args.http_port, BridgeRequestHandler)
     http_thread.start()
 
@@ -1272,7 +1203,6 @@ def main():
         except Exception:
             pass
 
-    # Register signal handlers (best effort on Windows)
     try:
         signal.signal(signal.SIGINT, handle_signal)
         if hasattr(signal, "SIGTERM"):
@@ -1280,7 +1210,7 @@ def main():
     except Exception:
         pass
 
-    # Run writer loop (blocking)
+    # Run writer loop (blocking) but keep HTTP server alive
     try:
         tw.run_forever()
     finally:
