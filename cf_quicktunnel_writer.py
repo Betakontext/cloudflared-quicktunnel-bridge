@@ -1,100 +1,56 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-r"""
+"""
 Cloudflared Quick Tunnel URL Writer with:
-- built-in stdlib HTTP pull endpoint (for LAN pull)
-- optional FTPS upload to stable public web space (Greensta) for Internet pull
-- static, read-only file server for selected ComfyUI output subfolders
-- optional health check and FTPS flag-triggered soft restart per instance
-- local filesystem flag watcher to restart ComfyUI service (optional)
-- .env support (stdlib-only) for credentials and configuration
+- Local HTTP bridge endpoints for reading the current tunnel URL
+- Optional FTPS upload of the URL JSON/TXT for Internet pull
+- Static, read-only file server for ComfyUI output subfolders
+- Health watcher to soft-restart cloudflared on failures
+- FTPS flag watcher to trigger actions on flag presence:
+    - cloudflared: soft-restart cloudflared (existing behavior)
+    - comfy: execute COMFY_RESTART_CMD or COMFY_STOP_CMD based on flags in comfy subdir
+    - both: do both actions
+- Optional local filesystem Comfy watcher (separate from FTPS) to restart/stop ComfyUI via flags
+- .env support (stdlib-only)
 
-Soft restart semantics:
-- HealthWatcher and FTPS FlagWatcher only request a cloudflared subprocess restart
-  (the HTTP server of this script remains up).
-- The Comfy flag watcher restarts the ComfyUI service/process on the same host,
-  using either systemctl or a custom command.
-
-Local endpoints (LAN):
+Key endpoints:
   GET /bridge/tunnel_url.json
   GET /bridge/tunnel_url.txt
   GET /health
   GET /
 
-Static file serving (read-only, configurable; defaults to ComfyUI's output/<subfolder>):
-  - GET /files/images/<path>  -> serves from FILES_IMAGES_DIR or falls back to FILES_ROOT
-  - GET /files/3d/<path>      -> serves from FILES_3D_DIR (e.g., output/3d)
-  - GET /files/mesh/<path>    -> serves from FILES_MESH_DIR (e.g., output/mesh)
-  - GET /files/video/<path>   -> serves from FILES_VIDEO_DIR (e.g., output/video)
-  - Directory listing (optional): /files/<sub>?list=json returns JSON list if enabled
+Static files (if enabled):
+  /files/images/<path>
+  /files/3d/<path>
+  /files/mesh/<path>
+  /files/video/<path>
+  Optional JSON listing via ?list=json
 
-Features:
-  - Safe path resolution (prevents directory traversal)
-  - MIME types for common formats (.mp4, .obj, .ply, .glb, .gltf, .stl, .fbx, .zip, .png, .jpg, .json, etc.)
-  - HTTP Range requests (206) for large video files (configurable)
-  - ETag and Last-Modified headers; basic caching
-  - CORS toggle for all endpoints (bridge and files)
-  - Optional Health check (polls a target URL and restarts cloudflared on repeated failures)
-  - Optional FTPS flag watcher (checks a remote FTPS directory for a restart flag and restarts cloudflared)
-  - Optional local filesystem flag watcher to restart ComfyUI service/process
+ENV highlights:
+  FTPS_ENABLE=true|false
+  FTPS_HOST=...
+  FTPS_USER=...
+  FTPS_PASS=...
+  FTPS_DIR=/dev.betakontext.de/slAIdshow/bridge
+  FTPS_RESTART_FLAG=restart.flag                 # cloudflared restart flag in FTPS_DIR root
+  FTPS_STOP_FLAG_NAME=stop.flag                  # NEW: comfy stop flag filename (in comfy subdir)
+  FTPS_CHECK_INTERVAL=30
+  FTPS_FLAG_ACTION=cloudflared|comfy|both
+  FTPS_COMFY_SUBDIR=comfy
 
-FTPS upload (optional, stdlib-only via ftplib.FTP_TLS):
-  - When enabled, after each URL change, upload JSON and TXT to the remote dir.
-  - Creates subdirectories if missing (best-effort).
+  # Local Comfy watchers/actions
+  COMFY_FLAG_WATCH_DIR=C:\\bridge\\comfy
+  COMFY_FLAG_NAME=restart.flag                   # local comfy restart flag
+  COMFY_STOP_FLAG_NAME=stop.flag                 # NEW: local comfy stop flag
+  COMFY_SERVICE_NAME=comfyui
+  COMFY_RESTART_CMD=powershell -ExecutionPolicy Bypass -File ".\\restart_comfyui.ps1"
+  COMFY_STOP_CMD=powershell -ExecutionPolicy Bypass -File ".\\stop_comfyui.ps1"     # NEW
+  COMFY_WATCH_INTERVAL=2.0
 
-.env usage (sample):
-
-    FTPS_ENABLE=true
-    FTPS_HOST=
-    FTPS_USER=
-    FTPS_PASS=
-    FTPS_DIR=
-    COMFY_URL=http://127.0.0.1:8188
-    HTTP_HOST=0.0.0.0
-    HTTP_PORT=8799
-    HTTP_CORS=false
-    CLOUDFLARED=cloudflared
-    OUT_DIR=./bridge_output
-    EDGE_PROTOCOL=http2
-    FILES_ENABLE=true
-    FILES_ROOT=./output
-    FILES_3D_DIR=./output/3d
-    FILES_MESH_DIR=./output/mesh
-    FILES_VIDEO_DIR=./output/video
-    FILES_IMAGES_DIR=./output     # optional; default fallback: FILES_ROOT
-    FILES_INDEX=true
-    FILES_RANGE=true
-    HEALTH_TARGET=http://127.0.0.1:8188   # optional; enable health watcher when set
-    HEALTH_INTERVAL=15
-    HEALTH_THRESHOLD=3
-    FTPS_RESTART_FLAG=restart.flag        # optional; enable FTPS flag watcher when FTPS_ENABLE and this set
-    FTPS_CHECK_INTERVAL=30
-
-    # Local ComfyUI restart flag watcher (filesystem-based)
-    COMFY_FLAG_WATCH_DIR=/bridge/comfy     # optional; enable when set
-    COMFY_FLAG_NAME=restart.flag           # optional; default restart.flag
-    COMFY_SERVICE_NAME=comfyui             # optional; used by systemctl restart
-    # COMFY_RESTART_CMD=/usr/bin/sudo /bin/systemctl restart comfyui  # optional override
-    COMFY_WATCH_INTERVAL=2.0               # seconds
-
-Priority:
-- CLI arguments override environment variables.
-- .env is loaded into os.environ before full CLI parsing.
-- If --env-file is omitted, the loader auto-discovers .env next to the script,
-  then in current working directory.
-
-Test checklist:
-1) Ensure cloudflared binary is reachable (or specify --cloudflared).
-2) Start the script without FTPS to verify local endpoints:
-   - curl http://127.0.0.1:8799/health
-   - curl http://127.0.0.1:8799/bridge/tunnel_url.json
-3) If FILES_ENABLE:
-   - curl http://127.0.0.1:8799/files/video/?list=json
-   - curl http://127.0.0.1:8799/files/images?list=json
-   - curl -I http://127.0.0.1:8799/files/images/sample.png
-4) Enable FTPS and check uploads on URL change. Ensure remote path is correct.
-5) For cloudflared soft restart: upload FTPS_RESTART_FLAG into FTPS_DIR.
-6) For ComfyUI restart: touch $COMFY_FLAG_WATCH_DIR/$COMFY_FLAG_NAME on local filesystem.
+Notes:
+- COMFY_*_CMD are executed via shell=True. Relative paths resolve against the Python process working directory.
+- FTPS watcher deletes detected flags after handling (best-effort).
+- "both" action checks root (cloudflared) and comfy_subdir (comfy) independently.
 """
 
 import argparse
@@ -114,10 +70,10 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Optional, Tuple, Dict, Any, List
 
-# ========== Cloudflared URL detection ==========
-TRYCF_RE = re.compile(r"https://[a-z0-9\-]+\.trycloudflare\.com", re.IGNORECASE)
+# ====== Regex to detect TryCloudflare URLs in cloudflared logs ======
+TRYCF_RE = re.compile(r"https://[a-z0-9\\-]+\\.trycloudflare\\.com", re.IGNORECASE)
 
-# ========== .env loader (stdlib-only) ==========
+# ====== .env loader (stdlib) ======
 
 def _strip_quotes(value: str) -> str:
     if (value.startswith('"') and value.endswith('"')) or (value.startswith("'") and value.endswith("'")):
@@ -125,14 +81,12 @@ def _strip_quotes(value: str) -> str:
     return value
 
 def load_env_file(path: str, overwrite: bool = False) -> int:
-    set_count = 0
+    count = 0
     try:
         with open(path, "r", encoding="utf-8") as f:
             for raw in f:
                 line = raw.strip()
-                if not line or line.startswith("#"):
-                    continue
-                if "=" not in line:
+                if not line or line.startswith("#") or "=" not in line:
                     continue
                 key, val = line.split("=", 1)
                 key = key.strip()
@@ -141,8 +95,8 @@ def load_env_file(path: str, overwrite: bool = False) -> int:
                     continue
                 if overwrite or (key not in os.environ):
                     os.environ[key] = val
-                    set_count += 1
-        return set_count
+                    count += 1
+        return count
     except FileNotFoundError:
         return 0
     except Exception as e:
@@ -161,9 +115,10 @@ def auto_discover_env_file(script_dir: str, cwd: str) -> Optional[str]:
 def env_flag_truthy(value: str) -> bool:
     return value.strip().lower() in ("1", "true", "yes", "on")
 
-# ========== Helpers ==========
+# ====== Utils ======
 
 def utc_now_iso() -> str:
+    # timezone-aware UTC string
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 def http_date(ts: float) -> str:
@@ -213,48 +168,29 @@ def safe_join(base_dir: str, rel_path: str) -> Optional[str]:
 
 def guess_mime_type(filename: str) -> str:
     ext = os.path.splitext(filename.lower())[1]
-    if ext in (".mp4",):
-        return "video/mp4"
-    if ext in (".webm",):
-        return "video/webm"
-    if ext in (".mov",):
-        return "video/quicktime"
-    if ext in (".mkv",):
-        return "video/x-matroska"
-    if ext in (".png",):
-        return "image/png"
-    if ext in (".jpg", ".jpeg"):
-        return "image/jpeg"
-    if ext in (".gif",):
-        return "image/gif"
-    if ext in (".bmp",):
-        return "image/bmp"
-    if ext in (".json",):
-        return "application/json; charset=utf-8"
-    if ext in (".txt", ".log"):
-        return "text/plain; charset=utf-8"
-    if ext in (".zip",):
-        return "application/zip"
-    if ext in (".tar", ".gz", ".tgz", ".bz2", ".xz"):
-        return "application/octet-stream"
+    if ext in (".mp4",): return "video/mp4"
+    if ext in (".webm",): return "video/webm"
+    if ext in (".mov",): return "video/quicktime"
+    if ext in (".mkv",): return "video/x-matroska"
+    if ext in (".png",): return "image/png"
+    if ext in (".jpg", ".jpeg"): return "image/jpeg"
+    if ext in (".gif",): return "image/gif"
+    if ext in (".bmp",): return "image/bmp"
+    if ext in (".json",): return "application/json; charset=utf-8"
+    if ext in (".txt", ".log"): return "text/plain; charset=utf-8"
+    if ext in (".zip",): return "application/zip"
+    if ext in (".tar", ".gz", ".tgz", ".bz2", ".xz"): return "application/octet-stream"
     # 3D/mesh
-    if ext in (".obj",):
-        return "model/obj"
-    if ext in (".ply",):
-        return "application/octet-stream"
-    if ext in (".stl",):
-        return "model/stl"
-    if ext in (".fbx",):
-        return "application/octet-stream"
-    if ext in (".glb",):
-        return "model/gltf-binary"
-    if ext in (".gltf",):
-        return "model/gltf+json"
-    if ext in (".usdz", ".usd", ".usda", ".usdc"):
-        return "application/octet-stream"
+    if ext in (".obj",): return "model/obj"
+    if ext in (".ply",): return "application/octet-stream"
+    if ext in (".stl",): return "model/stl"
+    if ext in (".fbx",): return "application/octet-stream"
+    if ext in (".glb",): return "model/gltf-binary"
+    if ext in (".gltf",): return "model/gltf+json"
+    if ext in (".usdz", ".usd", ".usda", ".usdc"): return "application/octet-stream"
     return "application/octet-stream"
 
-# ========== FTPS Upload (stdlib: ftplib) ==========
+# ====== FTPS (stdlib ftplib) ======
 from ftplib import FTP_TLS, all_errors as ftplib_errors
 from contextlib import contextmanager
 
@@ -325,15 +261,41 @@ def upload_with_retries(host: str, user: str, password: str, local_path: str, re
     print(f"[ftps] upload permanently failed: {last_exc}", flush=True)
     return False
 
-# ========== Cloudflared writer with SOFT RESTART ==========
+def ftps_path_join(*parts: str) -> str:
+    """Join FTPS path components with exactly one slash between, no trailing slash (except root)."""
+    cleaned = []
+    for idx, p in enumerate(parts):
+        p = (p or "").strip()
+        if idx == 0:
+            if p.endswith("/"):
+                p = p[:-1]
+            cleaned.append(p or "/")
+        else:
+            p = p.strip("/")
+            cleaned.append(p)
+    joined = "/".join([c for c in cleaned if c not in ("", "/")])
+    if (parts[0] or "").startswith("/"):
+        joined = "/" + joined if not joined.startswith("/") else joined
+    return joined or "/"
+
+def ftps_list_names(ftps: FTP_TLS) -> List[str]:
+    try:
+        return ftps.nlst()
+    except Exception:
+        return []
+
+def ftps_delete_if_exists(ftps: FTP_TLS, name: str) -> bool:
+    try:
+        ftps.delete(name)
+        return True
+    except Exception:
+        return False
+
+# ====== Cloudflared Tunnel Writer ======
 
 class TunnelWriter:
     """
-    Manage cloudflared subprocess, detect public URL, persist JSON/TXT, and optionally FTPS-upload.
-
-    Soft restart semantics:
-    - stop_evt: ends the entire writer (used on process shutdown SIGINT/SIGTERM)
-    - restart_evt: request to restart only cloudflared subprocess (health/flag watchers)
+    Manage cloudflared subprocess, detect public URL, persist JSON/TXT, optional FTPS upload, and handle soft restarts.
     """
 
     def __init__(self, cf_bin: str, comfy_url: str, out_dir: str, protocol: str = "http2",
@@ -345,13 +307,13 @@ class TunnelWriter:
         self.protocol = protocol
         self.proc: Optional[subprocess.Popen] = None
 
-        self.stop_evt = threading.Event()     # full stop (app exit)
-        self.restart_evt = threading.Event()  # soft restart request
+        self.stop_evt = threading.Event()
+        self.restart_evt = threading.Event()
 
         self.current_url = ""
         self.backoff = 2.0
 
-        # FTPS config
+        # FTPS config (for uploads)
         self.ftps_enable = ftps_enable
         self.ftps_host = ftps_host
         self.ftps_user = ftps_user
@@ -362,8 +324,6 @@ class TunnelWriter:
         os.makedirs(self.out_dir, exist_ok=True)
         self.json_path = os.path.join(self.out_dir, "tunnel_url.json")
         self.txt_path = os.path.join(self.out_dir, "tunnel_url.txt")
-
-    # -------- persistence / upload --------
 
     def write_urls_local(self, url: str):
         payload = {"url": url, "updated_at": utc_now_iso()}
@@ -386,13 +346,7 @@ class TunnelWriter:
                             self.txt_path, self.ftps_dir, remote_filename="tunnel_url.txt",
                             retries=self.ftps_retries)
 
-    # -------- lifecycle control --------
-
     def request_restart(self):
-        """
-        Soft-restart: terminate current cloudflared process and set restart flag.
-        The run_forever loop will respawn cloudflared without stopping the HTTP server.
-        """
         print("[writer] soft restart requested", flush=True)
         self.restart_evt.set()
         try:
@@ -403,9 +357,6 @@ class TunnelWriter:
             print(f"[writer] terminate error (ignored): {e}", flush=True)
 
     def stop(self):
-        """
-        Full stop: end loop and terminate cloudflared.
-        """
         print("[writer] full stop requested", flush=True)
         self.stop_evt.set()
         try:
@@ -413,8 +364,6 @@ class TunnelWriter:
                 self.proc.terminate()
         except Exception:
             pass
-
-    # -------- run loop --------
 
     def run_once(self):
         cmd = [
@@ -445,11 +394,10 @@ class TunnelWriter:
             for line in self.proc.stdout:
                 if self.stop_evt.is_set():
                     break
-                # If a restart was requested while streaming logs, break to end run_once quickly
                 if self.restart_evt.is_set():
                     print("[cloudflared] log reader noticed restart request", flush=True)
                     break
-                line = line.rstrip("\r\n")
+                line = line.rstrip("\\r\\n")
                 print(f"[cloudflared] {line}", flush=True)
                 m = TRYCF_RE.search(line)
                 if m:
@@ -465,7 +413,6 @@ class TunnelWriter:
         except Exception as e:
             print(f"[cloudflared] read error: {e}", flush=True)
 
-        # Ensure process ends when restart requested
         if self.restart_evt.is_set():
             try:
                 if self.proc and self.proc.poll() is None:
@@ -482,7 +429,6 @@ class TunnelWriter:
     def run_forever(self):
         print("[writer] run_forever started", flush=True)
         while not self.stop_evt.is_set():
-            # Clear restart flag BEFORE starting a run
             if self.restart_evt.is_set():
                 print("[writer] clearing pending restart flag before spawn", flush=True)
                 self.restart_evt.clear()
@@ -491,13 +437,10 @@ class TunnelWriter:
             if self.stop_evt.is_set():
                 break
 
-            # If a restart was requested during run_once, honor it immediately (no backoff)
             if self.restart_evt.is_set():
                 print("[writer] immediate respawn due to restart request", flush=True)
-                # loop continues to next iteration; restart_evt will be cleared at top
                 continue
 
-            # Otherwise, exponential backoff on natural crashes/exit
             t = self.backoff
             self.backoff = min(self.backoff * 1.5, 30.0)
             for _ in range(int(t / 0.1)):
@@ -512,13 +455,9 @@ class TunnelWriter:
         except Exception:
             return False
 
-# ========== Watchers (Health + FTPS flag) ==========
+# ====== Watchers ======
 
 class HealthWatcher(threading.Thread):
-    """
-    Periodically checks a target HTTP URL and requests a soft restart
-    if it seems unhealthy for N consecutive checks.
-    """
     def __init__(self, target_url: str, interval: int, threshold: int, tw: TunnelWriter):
         super().__init__(daemon=True)
         self.target_url = (target_url or "").strip()
@@ -536,15 +475,15 @@ class HealthWatcher(threading.Thread):
             req = urllib.request.Request(self.target_url, method="GET")
             with urllib.request.urlopen(req, timeout=8) as resp:
                 code = getattr(resp, "status", 200)
-                return 200 <= int(code) < 500  # 5xx => failure
+                return 200 <= int(code) < 500
         except Exception as e:
-            sys.stdout.write(f"[health] check error: {e}\n")
+            sys.stdout.write(f"[health] check error: {e}\\n")
             return False
 
     def run(self):
         if not self.target_url:
             return
-        sys.stdout.write(f"[health] watcher started target={self.target_url} interval={self.interval}s threshold={self.threshold}\n")
+        sys.stdout.write(f"[health] watcher started target={self.target_url} interval={self.interval}s threshold={self.threshold}\\n")
         while not self._stop.is_set():
             ok = self._check_once()
             if ok:
@@ -552,7 +491,7 @@ class HealthWatcher(threading.Thread):
             else:
                 self._fails += 1
                 if self._fails >= self.threshold:
-                    sys.stdout.write("[health] threshold reached -> soft restart cloudflared\n")
+                    sys.stdout.write("[health] threshold reached -> soft restart cloudflared\\n")
                     try:
                         self.tw.request_restart()
                     except Exception:
@@ -566,57 +505,158 @@ class HealthWatcher(threading.Thread):
     def stop(self):
         self._stop.set()
 
+# Global COMFY settings for local watcher and FTPS comfy exec
+COMFY_FLAG_WATCH_DIR = ""
+COMFY_FLAG_NAME = "restart.flag"
+COMFY_STOP_FLAG_NAME = "stop.flag"       # NEW
+COMFY_SERVICE_NAME = "comfyui"
+COMFY_RESTART_CMD = ""
+COMFY_STOP_CMD = ""                      # NEW
+COMFY_WATCH_INTERVAL = 2.0
+
+def _exec_shell_cmd(cmd: str, label: str) -> bool:
+    try:
+        print(f"[comfy] {label} via custom cmd: {cmd}", flush=True)
+        subprocess.run(cmd, shell=True, check=True)
+        return True
+    except Exception as e:
+        print(f"[comfy] {label} failed: {e}", flush=True)
+        return False
+
+def _restart_comfyui_via_cmd() -> bool:
+    """
+    Execute COMFY_RESTART_CMD if provided; else try systemctl restart COMFY_SERVICE_NAME (Linux).
+    """
+    if COMFY_RESTART_CMD:
+        return _exec_shell_cmd(COMFY_RESTART_CMD, "restart")
+    try:
+        print(f"[comfy] restarting via systemctl: {COMFY_SERVICE_NAME}", flush=True)
+        subprocess.run(["systemctl", "restart", COMFY_SERVICE_NAME], check=True)
+        return True
+    except Exception as e:
+        print(f"[comfy] restart failed: {e}", flush=True)
+        return False
+
+def _stop_comfyui_via_cmd() -> bool:
+    """
+    Execute COMFY_STOP_CMD if provided; else try systemctl stop COMFY_SERVICE_NAME (Linux).
+    """
+    if COMFY_STOP_CMD:
+        return _exec_shell_cmd(COMFY_STOP_CMD, "stop")
+    try:
+        print(f"[comfy] stopping via systemctl: {COMFY_SERVICE_NAME}", flush=True)
+        subprocess.run(["systemctl", "stop", COMFY_SERVICE_NAME], check=True)
+        return True
+    except Exception as e:
+        print(f"[comfy] stop failed: {e}", flush=True)
+        return False
+
 class FtpsFlagWatcher(threading.Thread):
     """
-    Periodically connects to FTPS and checks for a restart flag file.
-    If found, removes it and requests a soft restart of cloudflared.
+    FTPS watcher extended to support location-specific flags:
+      - Cloudflared flag must be in FTPS_DIR (root) -> FTPS_RESTART_FLAG
+      - Comfy flags are in FTPS_DIR/FTPS_COMFY_SUBDIR:
+          - restart.flag -> restart Comfy
+          - stop.flag    -> stop Comfy
+    Behavior:
+      - action=cloudflared -> check only root for cloudflared flag
+      - action=comfy      -> check only comfy_subdir for comfy flags
+      - action=both       -> check both; each location triggers only its associated action
     """
     def __init__(self, enabled: bool, host: str, user: str, password: str, remote_dir: str,
-                 flag_name: str, interval: int, tw: TunnelWriter):
+                 flag_name: str, interval: int, tw: TunnelWriter, action: str = "cloudflared",
+                 comfy_subdir: str = "comfy", comfy_stop_flag: str = "stop.flag"):
         super().__init__(daemon=True)
         self.enabled = bool(enabled)
         self.host = (host or "").strip()
         self.user = (user or "").strip()
         self.password = password or ""
         self.remote_dir = (remote_dir or "").rstrip("/")
-        self.flag_name = (flag_name or "").strip()
+        self.flag_name = (flag_name or "").strip()              # cloudflared restart in root
         self.interval = max(10, int(interval))
         self.tw = tw
+        self.action = (action or "cloudflared").strip().lower()
+        self.comfy_subdir = (comfy_subdir or "comfy").strip().strip("/")
+        self.comfy_stop_flag = (comfy_stop_flag or "stop.flag").strip()
         self._stop = threading.Event()
 
+    def _handle_cloudflared(self):
+        try:
+            print("[flag] action: soft-restart cloudflared", flush=True)
+            self.tw.request_restart()
+        except Exception as e:
+            print(f"[flag] cloudflared restart error (ignored): {e}", flush=True)
+
+    def _handle_comfy_restart(self):
+        print("[flag] action: restart ComfyUI via COMFY_RESTART_CMD/systemctl", flush=True)
+        ok = _restart_comfyui_via_cmd()
+        print(f"[flag] comfy restart status: {'ok' if ok else 'failed'}", flush=True)
+
+    def _handle_comfy_stop(self):
+        print("[flag] action: stop ComfyUI via COMFY_STOP_CMD/systemctl", flush=True)
+        ok = _stop_comfyui_via_cmd()
+        print(f"[flag] comfy stop status: {'ok' if ok else 'failed'}", flush=True)
+
+    def _check_path_for_name(self, ftps: FTP_TLS, path: str, fname: str) -> bool:
+        try:
+            ftps.cwd("/")
+            _ftps_mkdirs(ftps, path)
+            ftps.cwd(path)
+        except Exception as e:
+            sys.stdout.write(f"[flag] cannot access {path}: {e}\\n")
+            return False
+        names = ftps_list_names(ftps)
+        return fname in names
+
+    def _delete_flag(self, ftps: FTP_TLS, path: str, fname: str):
+        try:
+            ftps.cwd(path or "/")
+            removed = ftps_delete_if_exists(ftps, fname)
+            if removed:
+                sys.stdout.write(f"[flag] removed {fname} from {path}\\n")
+            else:
+                sys.stdout.write(f"[flag] delete failed for {path}/{fname} (continuing)\\n")
+        except Exception as e:
+            sys.stdout.write(f"[flag] delete error {path}/{fname}: {e}\\n")
+
     def _one_cycle(self):
-        if not self.enabled or not (self.host and self.user and self.password and self.remote_dir and self.flag_name):
+        if not self.enabled or not (self.host and self.user and self.password and self.remote_dir):
             return
         try:
             with ftps_connect(self.host, self.user, self.password, timeout=25.0) as ftps:
-                try:
-                    ftps.cwd(self.remote_dir)
-                except Exception:
-                    _ftps_mkdirs(ftps, self.remote_dir)
-                    ftps.cwd(self.remote_dir)
-                # List and detect the flag file
-                names: List[str] = []
-                try:
-                    names = ftps.nlst()
-                except Exception as e:
-                    sys.stdout.write(f"[flag] list error: {e}\n")
-                if self.flag_name in names:
-                    sys.stdout.write(f"[flag] detected {self.flag_name} -> removing and soft-restarting cloudflared\n")
-                    try:
-                        ftps.delete(self.flag_name)
-                    except Exception as e:
-                        sys.stdout.write(f"[flag] delete error: {e}\n")
-                    try:
-                        self.tw.request_restart()
-                    except Exception:
-                        pass
+                root_path = self.remote_dir or "/"
+                comfy_path = ftps_path_join(root_path, self.comfy_subdir) if self.comfy_subdir else root_path
+
+                if self.action in ("cloudflared", "both"):
+                    if self.flag_name:
+                        if self._check_path_for_name(ftps, root_path, self.flag_name):
+                            sys.stdout.write(f"[flag] detected {self.flag_name} in {root_path}\\n")
+                            self._delete_flag(ftps, root_path, self.flag_name)
+                            self._handle_cloudflared()
+
+                if self.action in ("comfy", "both"):
+                    # Check comfy restart.flag (reuse FTPS_RESTART_FLAG name if used for comfy? We keep restart.flag implicit)
+                    restart_flag = "restart.flag"
+                    # Restart
+                    if self._check_path_for_name(ftps, comfy_path, restart_flag):
+                        sys.stdout.write(f"[flag] detected {restart_flag} in {comfy_path}\\n")
+                        self._delete_flag(ftps, comfy_path, restart_flag)
+                        self._handle_comfy_restart()
+                    # Stop
+                    if self._check_path_for_name(ftps, comfy_path, self.comfy_stop_flag):
+                        sys.stdout.write(f"[flag] detected {self.comfy_stop_flag} in {comfy_path}\\n")
+                        self._delete_flag(ftps, comfy_path, self.comfy_stop_flag)
+                        self._handle_comfy_stop()
+
         except Exception as e:
-            sys.stdout.write(f"[flag] check error: {e}\n")
+            sys.stdout.write(f"[flag] check error: {e}\\n")
 
     def run(self):
         if not self.enabled:
             return
-        sys.stdout.write(f"[flag] watcher started dir={self.remote_dir} flag={self.flag_name} interval={self.interval}s\n")
+        sys.stdout.write(f"[flag] watcher started root={self.remote_dir} comfy_subdir={self.comfy_subdir or '(root)'} "
+                         f"root_flag={self.flag_name or '(none)'} stop_flag={self.comfy_stop_flag} "
+                         f"interval={self.interval}s action={self.action}\\n")
         while not self._stop.is_set():
             self._one_cycle()
             for _ in range(int(self.interval * 10)):
@@ -627,71 +667,45 @@ class FtpsFlagWatcher(threading.Thread):
     def stop(self):
         self._stop.set()
 
-# ========== Local ComfyUI filesystem flag watcher ==========
-
-# These ENV variables are read in main() and bound as globals for helpers.
-COMFY_FLAG_WATCH_DIR = ""
-COMFY_FLAG_NAME = "restart.flag"
-COMFY_SERVICE_NAME = "comfyui"
-COMFY_RESTART_CMD = ""
-COMFY_WATCH_INTERVAL = 2.0
-
-def _restart_comfyui_via_cmd() -> bool:
+def _check_and_handle_comfy_flags_local():
     """
-    Restart ComfyUI service using either a custom command (COMFY_RESTART_CMD)
-    or a systemctl restart of COMFY_SERVICE_NAME.
-    """
-    try:
-        if COMFY_RESTART_CMD:
-            print(f"[comfy] restarting via custom cmd: {COMFY_RESTART_CMD}", flush=True)
-            subprocess.run(COMFY_RESTART_CMD, shell=True, check=True)
-        else:
-            print(f"[comfy] restarting via systemctl: {COMFY_SERVICE_NAME}", flush=True)
-            subprocess.run(["systemctl", "restart", COMFY_SERVICE_NAME], check=True)
-        return True
-    except Exception as e:
-        print(f"[comfy] restart failed: {e}", flush=True)
-        return False
-
-def _check_and_handle_comfy_flag():
-    """
-    If COMFY_FLAG_WATCH_DIR is configured, check for 'restart.flag'.
-    If found: log, attempt restart, then remove the flag file.
+    Local filesystem comfy flag watcher handler (independent from FTPS).
+    - If COMFY_FLAG_WATCH_DIR/COMFY_FLAG_NAME exists -> restart Comfy and remove flag.
+    - If COMFY_FLAG_WATCH_DIR/COMFY_STOP_FLAG_NAME exists -> stop Comfy and remove flag.
     """
     if not COMFY_FLAG_WATCH_DIR:
         return
-    flag_path = os.path.join(COMFY_FLAG_WATCH_DIR, COMFY_FLAG_NAME)
+    # Restart flag
+    restart_path = os.path.join(COMFY_FLAG_WATCH_DIR, COMFY_FLAG_NAME)
     try:
-        if os.path.isfile(flag_path):
-            print(f"[comfy] {datetime.utcnow().isoformat()}Z flag detected: {flag_path}", flush=True)
+        if os.path.isfile(restart_path):
+            print(f"[comfy] {utc_now_iso()} restart flag detected: {restart_path}", flush=True)
             ok = _restart_comfyui_via_cmd()
             try:
-                os.remove(flag_path)
+                os.remove(restart_path)
             except Exception as e:
-                print(f"[comfy] failed to remove flag: {e}", flush=True)
-            if ok:
-                print(f"[comfy] {datetime.utcnow().isoformat()}Z restart completed", flush=True)
+                print(f"[comfy] failed to remove restart flag: {e}", flush=True)
+            print(f"[comfy] {utc_now_iso()} restart {'completed' if ok else 'failed'}", flush=True)
     except Exception as e:
-        print(f"[comfy] flag check error: {e}", flush=True)
+        print(f"[comfy] restart flag check error: {e}", flush=True)
 
-# ========== HTTP server (bridge + static files) ==========
+    # Stop flag
+    stop_path = os.path.join(COMFY_FLAG_WATCH_DIR, COMFY_STOP_FLAG_NAME)
+    try:
+        if os.path.isfile(stop_path):
+            print(f"[comfy] {utc_now_iso()} stop flag detected: {stop_path}", flush=True)
+            ok = _stop_comfyui_via_cmd()
+            try:
+                os.remove(stop_path)
+            except Exception as e:
+                print(f"[comfy] failed to remove stop flag: {e}", flush=True)
+            print(f"[comfy] {utc_now_iso()} stop {'completed' if ok else 'failed'}", flush=True)
+    except Exception as e:
+        print(f"[comfy] stop flag check error: {e}", flush=True)
+
+# ====== HTTP Server ======
 
 class BridgeRequestHandler(BaseHTTPRequestHandler):
-    """
-    Serves:
-      - Bridge endpoints:
-        - GET /bridge/tunnel_url.json
-        - GET /bridge/tunnel_url.txt
-        - GET /health
-        - GET /
-      - Static files (read-only):
-        - GET /files/images/<path> -> FILES_IMAGES_DIR or FILES_ROOT
-        - GET /files/3d/<path>     -> FILES_3D_DIR
-        - GET /files/mesh/<path>   -> FILES_MESH_DIR
-        - GET /files/video/<path>  -> FILES_VIDEO_DIR
-        - Optional listing: /files/<sub>?list=json
-    """
-
     out_dir: str = "."
     json_path: str = "tunnel_url.json"
     txt_path: str = "tunnel_url.txt"
@@ -703,7 +717,7 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
     files_range: bool = False
     dirs_map: Dict[str, str] = {}
 
-    server_version = "BridgeServer/1.6"
+    server_version = "BridgeServer/1.8"
     sys_version = ""
 
     def _set_common_headers(self, status: int, content_type: str, extra: Optional[Dict[str, str]] = None):
@@ -851,7 +865,7 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
             except BrokenPipeError:
                 pass
             except Exception as e:
-                sys.stdout.write(f"[http] error sending range: {e}\n")
+                sys.stdout.write(f"[http] error sending range: {e}\\n")
             return
 
         headers = {
@@ -872,25 +886,25 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
         except BrokenPipeError:
             pass
         except Exception as e:
-            sys.stdout.write(f"[http] error sending file: {e}\n")
+            sys.stdout.write(f"[http] error sending file: {e}\\n")
 
     def do_GET(self):
         try:
             if self.path == "/":
                 self._set_common_headers(HTTPStatus.OK, "text/plain; charset=utf-8")
                 body = (
-                    "Cloudflared Quick Tunnel Bridge\n"
-                    "Bridge Endpoints:\n"
-                    "  GET /bridge/tunnel_url.json\n"
-                    "  GET /bridge/tunnel_url.txt\n"
-                    "  GET /health\n"
-                    "\n"
-                    "Static File Endpoints (read-only):\n"
-                    "  GET /files/images/<path>\n"
-                    "  GET /files/3d/<path>\n"
-                    "  GET /files/mesh/<path>\n"
-                    "  GET /files/video/<path>\n"
-                    "  Optional listing: /files/<sub>?list=json\n"
+                    "Cloudflared Quick Tunnel Bridge\\n"
+                    "Bridge Endpoints:\\n"
+                    "  GET /bridge/tunnel_url.json\\n"
+                    "  GET /bridge/tunnel_url.txt\\n"
+                    "  GET /health\\n"
+                    "\\n"
+                    "Static File Endpoints (read-only):\\n"
+                    "  GET /files/images/<path>\\n"
+                    "  GET /files/3d/<path>\\n"
+                    "  GET /files/mesh/<path>\\n"
+                    "  GET /files/video/<path>\\n"
+                    "  Optional listing: /files/<sub>?list=json\\n"
                 )
                 self.wfile.write(body.encode("utf-8"))
                 return
@@ -981,7 +995,7 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
                 pass
 
     def log_message(self, fmt, *args):
-        sys.stdout.write("[http] " + (fmt % args) + "\n")
+        sys.stdout.write("[http] " + (fmt % args) + "\\n")
 
 class HttpServerThread(threading.Thread):
     def __init__(self, host: str, port: int, handler_cls: type):
@@ -1021,7 +1035,7 @@ class HttpServerThread(threading.Thread):
             pass
         self._stopped.wait(timeout=3.0)
 
-# ========== Utilities ==========
+# ====== CLI & Main ======
 
 def find_default_cloudflared(script_path: str) -> str:
     base = os.path.dirname(os.path.abspath(script_path))
@@ -1037,8 +1051,6 @@ def find_default_cloudflared(script_path: str) -> str:
             return c
     return "cloudflared"
 
-# ========== Main ==========
-
 def parse_stage1_args(argv=None):
     p = argparse.ArgumentParser(add_help=False)
     p.add_argument("--env-file", type=str, default="", help="Path to .env file to load before full parsing")
@@ -1046,48 +1058,53 @@ def parse_stage1_args(argv=None):
     return p.parse_known_args(argv)
 
 def parse_stage2_args(argv=None):
-    p = argparse.ArgumentParser(description="Cloudflared Quick Tunnel URL Writer with LAN HTTP endpoint, optional FTPS upload, static file serving, health checks, FTPS soft restart flag, local Comfy flag watcher, and .env support")
+    p = argparse.ArgumentParser(description="Cloudflared Quick Tunnel Bridge with FTPS uploads, health checks, FTPS flags (cloudflared/comfy restart/stop), optional local Comfy watcher, and static file serving.")
     # Primary settings
-    p.add_argument("--cloudflared", type=str, default=os.getenv("CLOUDFLARED", ""), help="Path to cloudflared binary (auto-discover if empty or 'cloudflared')")
-    p.add_argument("--comfy-url", type=str, default=os.getenv("COMFY_URL", "http://127.0.0.1:8188"), help="Local URL to expose via tunnel (e.g., ComfyUI or this bridge)")
-    p.add_argument("--out-dir", type=str, default=os.getenv("OUT_DIR", ""), help="Directory to write tunnel_url.json and tunnel_url.txt")
-    p.add_argument("--protocol", type=str, default=os.getenv("EDGE_PROTOCOL", "http2"), choices=["quic", "http2"], help="Cloudflared edge protocol")
+    p.add_argument("--cloudflared", type=str, default=os.getenv("CLOUDFLARED", ""), help="Path to cloudflared binary")
+    p.add_argument("--comfy-url", type=str, default=os.getenv("COMFY_URL", "http://127.0.0.1:8188"), help="Local URL to expose via tunnel")
+    p.add_argument("--out-dir", type=str, default=os.getenv("OUT_DIR", ""), help="Directory to write tunnel_url.json/txt")
+    p.add_argument("--protocol", type=str, default=os.getenv("EDGE_PROTOCOL", "http2"), choices=["quic", "http2"], help="Edge protocol")
 
-    # HTTP endpoint (LAN)
-    p.add_argument("--http-host", type=str, default=os.getenv("HTTP_HOST", "0.0.0.0"), help="HTTP bind host for pull endpoint")
-    p.add_argument("--http-port", type=int, default=int(os.getenv("HTTP_PORT", "8799")), help="HTTP bind port for pull endpoint")
-    default_cors_env = os.getenv("HTTP_CORS", "false")
-    p.add_argument("--http-cors", action="store_true", default=env_flag_truthy(default_cors_env), help="Enable CORS (Access-Control-Allow-Origin: *)")
+    # HTTP endpoint
+    p.add_argument("--http-host", type=str, default=os.getenv("HTTP_HOST", "0.0.0.0"), help="HTTP bind host")
+    p.add_argument("--http-port", type=int, default=int(os.getenv("HTTP_PORT", "8799")), help="HTTP bind port")
+    p.add_argument("--http-cors", action="store_true", default=env_flag_truthy(os.getenv("HTTP_CORS", "false")), help="Enable CORS")
 
     # FTPS upload options
-    default_ftps_enable = env_flag_truthy(os.getenv("FTPS_ENABLE", "false"))
-    p.add_argument("--ftps-enable", action="store_true", default=default_ftps_enable, help="Enable FTPS upload on URL changes")
-    p.add_argument("--ftps-host", type=str, default=os.getenv("FTPS_HOST", ""), help="FTPS host (e.g., web8.greensta.de)")
+    p.add_argument("--ftps-enable", action="store_true", default=env_flag_truthy(os.getenv("FTPS_ENABLE", "false")), help="Enable FTPS upload on URL changes")
+    p.add_argument("--ftps-host", type=str, default=os.getenv("FTPS_HOST", ""), help="FTPS host")
     p.add_argument("--ftps-user", type=str, default=os.getenv("FTPS_USER", ""), help="FTPS username")
     p.add_argument("--ftps-pass", type=str, default=os.getenv("FTPS_PASS", ""), help="FTPS password")
-    p.add_argument("--ftps-dir", type=str, default=os.getenv("FTPS_DIR", ""), help="Remote directory path (e.g., /dev.betakontext.de/slAIdshow/bridge)")
-    p.add_argument("--ftps-retries", type=int, default=int(os.getenv("FTPS_RETRIES", "5")), help="Retry count for FTPS uploads")
+    p.add_argument("--ftps-dir", type=str, default=os.getenv("FTPS_DIR", ""), help="FTPS remote directory")
+    p.add_argument("--ftps-retries", type=int, default=int(os.getenv("FTPS_RETRIES", "5")), help="FTPS upload retries")
 
-    # Static files options
-    p.add_argument("--files-enable", action="store_true", default=env_flag_truthy(os.getenv("FILES_ENABLE", "false")), help="Enable static file serving under /files/*")
-    p.add_argument("--files-root", type=str, default=os.getenv("FILES_ROOT", ""), help="Root directory for files (used for relative defaults)")
-    p.add_argument("--files-3d-dir", type=str, default=os.getenv("FILES_3D_DIR", ""), help="Absolute or relative path to 3D files directory (default: <root>/3d)")
-    p.add_argument("--files-mesh-dir", type=str, default=os.getenv("FILES_MESH_DIR", ""), help="Absolute or relative path to mesh files directory (default: <root>/mesh)")
-    p.add_argument("--files-video-dir", type=str, default=os.getenv("FILES_VIDEO_DIR", ""), help="Absolute or relative path to video files directory (default: <root>/video)")
-    p.add_argument("--files-images-dir", type=str, default=os.getenv("FILES_IMAGES_DIR", ""), help="Absolute or relative path to images directory (default: FILES_ROOT)")
-    p.add_argument("--files-index", action="store_true", default=env_flag_truthy(os.getenv("FILES_INDEX", "false")), help="Enable directory listing JSON via ?list=json")
-    p.add_argument("--files-range", action="store_true", default=env_flag_truthy(os.getenv("FILES_RANGE", "true")), help="Enable HTTP Range (206) for file downloads (recommended for video)")
+    # Static files
+    p.add_argument("--files-enable", action="store_true", default=env_flag_truthy(os.getenv("FILES_ENABLE", "false")), help="Enable static file serving")
+    p.add_argument("--files-root", type=str, default=os.getenv("FILES_ROOT", ""), help="Files root for defaults")
+    p.add_argument("--files-3d-dir", type=str, default=os.getenv("FILES_3D_DIR", ""), help="3D files dir")
+    p.add_argument("--files-mesh-dir", type=str, default=os.getenv("FILES_MESH_DIR", ""), help="Mesh files dir")
+    p.add_argument("--files-video-dir", type=str, default=os.getenv("FILES_VIDEO_DIR", ""), help="Video files dir")
+    p.add_argument("--files-images-dir", type=str, default=os.getenv("FILES_IMAGES_DIR", ""), help="Images dir")
+    p.add_argument("--files-index", action="store_true", default=env_flag_truthy(os.getenv("FILES_INDEX", "false")), help="Enable directory listing JSON")
+    p.add_argument("--files-range", action="store_true", default=env_flag_truthy(os.getenv("FILES_RANGE", "true")), help="Enable HTTP Range")
 
     # Health/flag options
-    p.add_argument("--health-target", type=str, default=os.getenv("HEALTH_TARGET", ""), help="URL to poll for health checks (restart cloudflared on failures)")
-    p.add_argument("--health-interval", type=int, default=int(os.getenv("HEALTH_INTERVAL", "15")), help="Health check interval seconds")
-    p.add_argument("--health-threshold", type=int, default=int(os.getenv("HEALTH_THRESHOLD", "3")), help="Consecutive failures before restart")
-    p.add_argument("--ftps-restart-flag", type=str, default=os.getenv("FTPS_RESTART_FLAG", ""), help="Filename to watch on FTPS for remote-triggered restart (e.g., restart.flag) for cloudflared")
-    p.add_argument("--ftps-check-interval", type=int, default=int(os.getenv("FTPS_CHECK_INTERVAL", "30")), help="Seconds between FTPS checks")
+    p.add_argument("--health-target", type=str, default=os.getenv("HEALTH_TARGET", ""), help="Health check URL")
+    p.add_argument("--health-interval", type=int, default=int(os.getenv("HEALTH_INTERVAL", "15")), help="Health check interval")
+    p.add_argument("--health-threshold", type=int, default=int(os.getenv("HEALTH_THRESHOLD", "3")), help="Health consecutive failure threshold")
 
-    # Keep stage1 flags for help visibility
-    p.add_argument("--env-file", type=str, default=os.getenv("ENV_FILE", ""), help="Path to .env file (already loaded if provided earlier)")
-    p.add_argument("--no-auto-env", action="store_true", default=env_flag_truthy(os.getenv("NO_AUTO_ENV", "false")), help="Disable auto-discovery of .env")
+    # FTPS flag watcher options
+    p.add_argument("--ftps-restart-flag", type=str, default=os.getenv("FTPS_RESTART_FLAG", ""), help="Filename in FTPS_DIR root to watch for cloudflared restart (e.g., restart.flag)")
+    p.add_argument("--ftps-stop-flag-name", type=str, default=os.getenv("FTPS_STOP_FLAG_NAME", "stop.flag"), help="Comfy stop flag filename in comfy subdir (default: stop.flag)")  # NEW
+    p.add_argument("--ftps-check-interval", type=int, default=int(os.getenv("FTPS_CHECK_INTERVAL", "30")), help="Seconds between FTPS checks")
+    p.add_argument("--ftps-flag-action", type=str, default=os.getenv("FTPS_FLAG_ACTION", "cloudflared"),
+                   choices=["cloudflared", "comfy", "both"], help="Action when flags are found")
+    p.add_argument("--ftps-comfy-subdir", type=str, default=os.getenv("FTPS_COMFY_SUBDIR", "comfy"),
+                   help="Subdirectory under FTPS_DIR where Comfy flags must exist (restart.flag/stop.flag)")
+
+    # Stage1 carry-over
+    p.add_argument("--env-file", type=str, default=os.getenv("ENV_FILE", ""), help="Path to .env file (already loaded)")
+    p.add_argument("--no-auto-env", action="store_true", default=env_flag_truthy(os.getenv("NO_AUTO_ENV", "false")), help="Disable .env auto-discovery")
 
     return p.parse_args(argv)
 
@@ -1103,37 +1120,31 @@ def _resolve_dir(path_value: str, root_fallback: str, sub: str, script_dir: str)
     return os.path.join(base, sub)
 
 def main():
-    # Stage 1: early parse for .env loading
+    # Stage1: early parse for .env
     stage1_args, remaining = parse_stage1_args()
-
-    # Load .env if provided, else auto-discover unless disabled
     script_dir = os.path.dirname(os.path.abspath(__file__))
     cwd = os.getcwd()
-    env_loaded_from = None
 
     if stage1_args.env_file:
         count = load_env_file(stage1_args.env_file, overwrite=False)
-        env_loaded_from = stage1_args.env_file if count >= 0 else None
         print(f"[env] loaded {count} keys from {stage1_args.env_file}", flush=True)
     elif not stage1_args.no_auto_env:
         auto_env = auto_discover_env_file(script_dir, cwd)
         if auto_env:
             count = load_env_file(auto_env, overwrite=False)
-            env_loaded_from = auto_env if count >= 0 else None
             print(f"[env] auto-loaded {count} keys from {auto_env}", flush=True)
         else:
             print("[env] no .env discovered", flush=True)
     else:
         print("[env] auto-discovery disabled", flush=True)
 
-    # Stage 2: full parse
+    # Stage2: full args
     args = parse_stage2_args(remaining)
 
-    # Resolve binaries and dirs
+    # Resolve paths and dirs
     cf_bin = (args.cloudflared or "").strip() or find_default_cloudflared(__file__)
     out_dir = (args.out_dir or "").strip() or (os.path.dirname(os.path.abspath(__file__)) or ".")
 
-    # Resolve file directories
     files_root = (args.files_root or "").strip()
     if files_root and not os.path.isabs(files_root):
         files_root = os.path.abspath(os.path.join(script_dir, files_root))
@@ -1158,38 +1169,37 @@ def main():
         f"ftps_pass={masked_pass}, ftps_dir={args.ftps_dir}, ftps_retries={args.ftps_retries}, "
         f"health_target={args.health_target or '(disabled)'}, "
         f"health_interval={args.health_interval}, health_threshold={args.health_threshold}, "
-        f"ftps_flag={args.ftps_restart_flag or '(disabled)'}, ftps_check_interval={args.ftps_check_interval}, "
-        f"env_file={(env_loaded_from or 'none')}",
+        f"ftps_flag(root)={args.ftps_restart_flag or '(disabled)'}, ftps_check_interval={args.ftps_check_interval}, "
+        f"ftps_flag_action={args.ftps_flag_action}, ftps_comfy_subdir={args.ftps_comfy_subdir}, "
+        f"ftps_stop_flag_name={args.ftps_stop_flag_name}",
         flush=True,
     )
 
-    # Read local Comfy flag watcher ENV (after .env is loaded)
-    global COMFY_FLAG_WATCH_DIR, COMFY_FLAG_NAME, COMFY_SERVICE_NAME, COMFY_RESTART_CMD, COMFY_WATCH_INTERVAL
+    # Global COMFY settings from ENV (used by FTPS comfy action and local watcher)
+    global COMFY_FLAG_WATCH_DIR, COMFY_FLAG_NAME, COMFY_STOP_FLAG_NAME, COMFY_SERVICE_NAME, COMFY_RESTART_CMD, COMFY_STOP_CMD, COMFY_WATCH_INTERVAL
     COMFY_FLAG_WATCH_DIR = os.getenv("COMFY_FLAG_WATCH_DIR", "").strip()
     COMFY_FLAG_NAME = (os.getenv("COMFY_FLAG_NAME", "restart.flag").strip() or "restart.flag")
+    COMFY_STOP_FLAG_NAME = (os.getenv("COMFY_STOP_FLAG_NAME", "stop.flag").strip() or "stop.flag")
     COMFY_SERVICE_NAME = (os.getenv("COMFY_SERVICE_NAME", "comfyui").strip() or "comfyui")
     COMFY_RESTART_CMD = os.getenv("COMFY_RESTART_CMD", "").strip()
+    COMFY_STOP_CMD = os.getenv("COMFY_STOP_CMD", "").strip()
     try:
         COMFY_WATCH_INTERVAL = float(os.getenv("COMFY_WATCH_INTERVAL", "2.0"))
     except Exception:
         COMFY_WATCH_INTERVAL = 2.0
 
     if COMFY_FLAG_WATCH_DIR:
-        print(f"[comfy] watch_dir={COMFY_FLAG_WATCH_DIR} flag={COMFY_FLAG_NAME} service={COMFY_SERVICE_NAME} interval={COMFY_WATCH_INTERVAL}", flush=True)
+        print(f"[comfy] local watcher: dir={COMFY_FLAG_WATCH_DIR} restart_flag={COMFY_FLAG_NAME} stop_flag={COMFY_STOP_FLAG_NAME} service={COMFY_SERVICE_NAME} interval={COMFY_WATCH_INTERVAL}", flush=True)
     else:
-        print("[comfy] local flag watcher disabled (COMFY_FLAG_WATCH_DIR not set)", flush=True)
+        print("[comfy] local watcher disabled (COMFY_FLAG_WATCH_DIR not set)", flush=True)
 
-    # Validate FTPS config if enabled
+    # Validate FTPS credentials when enabled
     if args.ftps_enable:
         missing = []
-        if not args.ftps_host:
-            missing.append("FTPS_HOST/--ftps-host")
-        if not args.ftps_user:
-            missing.append("FTPS_USER/--ftps-user")
-        if not args.ftps_pass:
-            missing.append("FTPS_PASS/--ftps-pass")
-        if not args.ftps_dir:
-            missing.append("FTPS_DIR/--ftps-dir")
+        if not args.ftps_host: missing.append("FTPS_HOST/--ftps-host")
+        if not args.ftps_user: missing.append("FTPS_USER/--ftps-user")
+        if not args.ftps_pass: missing.append("FTPS_PASS/--ftps-pass")
+        if not args.ftps_dir:  missing.append("FTPS_DIR/--ftps-dir")
         if missing:
             print(f"[main] error: --ftps-enable requires: {', '.join(missing)}", flush=True)
             sys.exit(2)
@@ -1208,7 +1218,7 @@ def main():
         ftps_retries=args.ftps_retries,
     )
 
-    # Prepare HTTP handler shared config
+    # HTTP handler shared config
     BridgeRequestHandler.out_dir = out_dir
     BridgeRequestHandler.json_path = os.path.join(out_dir, "tunnel_url.json")
     BridgeRequestHandler.txt_path = os.path.join(out_dir, "tunnel_url.txt")
@@ -1243,31 +1253,34 @@ def main():
         )
         health_watcher.start()
 
-    if bool(args.ftps_enable) and (args.ftps_restart_flag or "").strip():
+    if bool(args.ftps_enable) and (args.ftps_restart_flag or args.ftps_flag_action in ("comfy", "both")):
+        # Enable FTPS watcher if either root restart flag is configured OR comfy mode is requested (to catch comfy flags)
         flag_watcher = FtpsFlagWatcher(
             enabled=True,
             host=args.ftps_host.strip(),
             user=args.ftps_user.strip(),
             password=args.ftps_pass,
             remote_dir=args.ftps_dir.strip(),
-            flag_name=args.ftps_restart_flag.strip(),
+            flag_name=(args.ftps_restart_flag or "").strip(),
             interval=int(args.ftps_check_interval),
             tw=tw,
+            action=args.ftps_flag_action.strip().lower(),
+            comfy_subdir=(args.ftps_comfy_subdir or "comfy").strip(),
+            comfy_stop_flag=(args.ftps_stop_flag_name or "stop.flag").strip(),
         )
         flag_watcher.start()
 
-    # Local Comfy flag watcher thread (filesystem-based)
+    # Local Comfy flag watcher thread (independent, optional)
     comfy_flag_thread = None
     stop_local_watcher = threading.Event()
     if COMFY_FLAG_WATCH_DIR:
         os.makedirs(COMFY_FLAG_WATCH_DIR, exist_ok=True)
 
         def _comfy_flag_loop():
-            print(f"[comfy] local watcher started dir={COMFY_FLAG_WATCH_DIR} flag={COMFY_FLAG_NAME} interval={COMFY_WATCH_INTERVAL}s", flush=True)
+            print(f"[comfy] local watcher started dir={COMFY_FLAG_WATCH_DIR} restart_flag={COMFY_FLAG_NAME} stop_flag={COMFY_STOP_FLAG_NAME} interval={COMFY_WATCH_INTERVAL}s", flush=True)
             try:
                 while not stop_local_watcher.is_set():
-                    _check_and_handle_comfy_flag()
-                    # Minimum sleep to avoid busy-loop; configurable via COMFY_WATCH_INTERVAL
+                    _check_and_handle_comfy_flags_local()
                     time.sleep(max(0.5, COMFY_WATCH_INTERVAL))
             except Exception as e:
                 print(f"[comfy] watcher thread error: {e}", flush=True)
@@ -1307,7 +1320,7 @@ def main():
     except Exception:
         pass
 
-    # Run writer loop (blocking) but keep HTTP server and watchers alive
+    # Run writer loop (blocking)
     try:
         tw.run_forever()
     finally:
