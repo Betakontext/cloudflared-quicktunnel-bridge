@@ -18,6 +18,10 @@ Thumbs.db
 # Cloudflared executable
 cloudflared-windows-amd64.exe
 
-# previous Versions
+# Previous Versions
 cf_quicktunnel_writer00.py
 cf_quicktunnel_writer01.py
+
+# Temp folders
+bridge_output_files/
+bridge_output/
