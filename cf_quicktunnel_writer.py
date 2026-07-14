@@ -6,13 +6,16 @@ Cloudflared Quick Tunnel URL Writer with:
 - optional FTPS upload to stable public web space (Greensta) for Internet pull
 - static, read-only file server for selected ComfyUI output subfolders
 - optional health check and FTPS flag-triggered soft restart per instance
+- local filesystem flag watcher to restart ComfyUI service (optional)
 - .env support (stdlib-only) for credentials and configuration
 
-This version implements a SOFT RESTART:
-- FTPS flag or HealthWatcher no longer stop the whole app.
-- They only request a cloudflared subprocess restart (HTTP server keeps running).
+Soft restart semantics:
+- HealthWatcher and FTPS FlagWatcher only request a cloudflared subprocess restart
+  (the HTTP server of this script remains up).
+- The Comfy flag watcher restarts the ComfyUI service/process on the same host,
+  using either systemctl or a custom command.
 
-Endpoints served locally (optional for LAN):
+Local endpoints (LAN):
   GET /bridge/tunnel_url.json
   GET /bridge/tunnel_url.txt
   GET /health
@@ -32,15 +35,15 @@ Features:
   - ETag and Last-Modified headers; basic caching
   - CORS toggle for all endpoints (bridge and files)
   - Optional Health check (polls a target URL and restarts cloudflared on repeated failures)
-  - Optional FTPS flag watcher (checks a remote FTPS directory for a restart flag and restarts on demand)
+  - Optional FTPS flag watcher (checks a remote FTPS directory for a restart flag and restarts cloudflared)
+  - Optional local filesystem flag watcher to restart ComfyUI service/process
 
 FTPS upload (optional, stdlib-only via ftplib.FTP_TLS):
   - When enabled, after each URL change, upload JSON and TXT to the remote dir.
   - Creates subdirectories if missing (best-effort).
 
-.env usage:
+.env usage (sample):
 
-- Place a .env file next to this script (or provide --env-file) with lines like:
     FTPS_ENABLE=true
     FTPS_HOST=
     FTPS_USER=
@@ -67,6 +70,13 @@ FTPS upload (optional, stdlib-only via ftplib.FTP_TLS):
     FTPS_RESTART_FLAG=restart.flag        # optional; enable FTPS flag watcher when FTPS_ENABLE and this set
     FTPS_CHECK_INTERVAL=30
 
+    # Local ComfyUI restart flag watcher (filesystem-based)
+    COMFY_FLAG_WATCH_DIR=/bridge/comfy     # optional; enable when set
+    COMFY_FLAG_NAME=restart.flag           # optional; default restart.flag
+    COMFY_SERVICE_NAME=comfyui             # optional; used by systemctl restart
+    # COMFY_RESTART_CMD=/usr/bin/sudo /bin/systemctl restart comfyui  # optional override
+    COMFY_WATCH_INTERVAL=2.0               # seconds
+
 Priority:
 - CLI arguments override environment variables.
 - .env is loaded into os.environ before full CLI parsing.
@@ -74,7 +84,7 @@ Priority:
   then in current working directory.
 
 Test checklist:
-1) Start cloudflared binary is reachable (or specify --cloudflared).
+1) Ensure cloudflared binary is reachable (or specify --cloudflared).
 2) Start the script without FTPS to verify local endpoints:
    - curl http://127.0.0.1:8799/health
    - curl http://127.0.0.1:8799/bridge/tunnel_url.json
@@ -83,7 +93,8 @@ Test checklist:
    - curl http://127.0.0.1:8799/files/images?list=json
    - curl -I http://127.0.0.1:8799/files/images/sample.png
 4) Enable FTPS and check uploads on URL change. Ensure remote path is correct.
-5) Upload restart.flag to your configured FTPS_DIR and confirm only cloudflared restarts, HTTP server stays up.
+5) For cloudflared soft restart: upload FTPS_RESTART_FLAG into FTPS_DIR.
+6) For ComfyUI restart: touch $COMFY_FLAG_WATCH_DIR/$COMFY_FLAG_NAME on local filesystem.
 """
 
 import argparse
@@ -558,7 +569,7 @@ class HealthWatcher(threading.Thread):
 class FtpsFlagWatcher(threading.Thread):
     """
     Periodically connects to FTPS and checks for a restart flag file.
-    If found, removes it and requests a soft restart.
+    If found, removes it and requests a soft restart of cloudflared.
     """
     def __init__(self, enabled: bool, host: str, user: str, password: str, remote_dir: str,
                  flag_name: str, interval: int, tw: TunnelWriter):
@@ -590,7 +601,7 @@ class FtpsFlagWatcher(threading.Thread):
                 except Exception as e:
                     sys.stdout.write(f"[flag] list error: {e}\n")
                 if self.flag_name in names:
-                    sys.stdout.write(f"[flag] detected {self.flag_name} -> removing and soft-restarting\n")
+                    sys.stdout.write(f"[flag] detected {self.flag_name} -> removing and soft-restarting cloudflared\n")
                     try:
                         ftps.delete(self.flag_name)
                     except Exception as e:
@@ -615,6 +626,53 @@ class FtpsFlagWatcher(threading.Thread):
 
     def stop(self):
         self._stop.set()
+
+# ========== Local ComfyUI filesystem flag watcher ==========
+
+# These ENV variables are read in main() and bound as globals for helpers.
+COMFY_FLAG_WATCH_DIR = ""
+COMFY_FLAG_NAME = "restart.flag"
+COMFY_SERVICE_NAME = "comfyui"
+COMFY_RESTART_CMD = ""
+COMFY_WATCH_INTERVAL = 2.0
+
+def _restart_comfyui_via_cmd() -> bool:
+    """
+    Restart ComfyUI service using either a custom command (COMFY_RESTART_CMD)
+    or a systemctl restart of COMFY_SERVICE_NAME.
+    """
+    try:
+        if COMFY_RESTART_CMD:
+            print(f"[comfy] restarting via custom cmd: {COMFY_RESTART_CMD}", flush=True)
+            subprocess.run(COMFY_RESTART_CMD, shell=True, check=True)
+        else:
+            print(f"[comfy] restarting via systemctl: {COMFY_SERVICE_NAME}", flush=True)
+            subprocess.run(["systemctl", "restart", COMFY_SERVICE_NAME], check=True)
+        return True
+    except Exception as e:
+        print(f"[comfy] restart failed: {e}", flush=True)
+        return False
+
+def _check_and_handle_comfy_flag():
+    """
+    If COMFY_FLAG_WATCH_DIR is configured, check for 'restart.flag'.
+    If found: log, attempt restart, then remove the flag file.
+    """
+    if not COMFY_FLAG_WATCH_DIR:
+        return
+    flag_path = os.path.join(COMFY_FLAG_WATCH_DIR, COMFY_FLAG_NAME)
+    try:
+        if os.path.isfile(flag_path):
+            print(f"[comfy] {datetime.utcnow().isoformat()}Z flag detected: {flag_path}", flush=True)
+            ok = _restart_comfyui_via_cmd()
+            try:
+                os.remove(flag_path)
+            except Exception as e:
+                print(f"[comfy] failed to remove flag: {e}", flush=True)
+            if ok:
+                print(f"[comfy] {datetime.utcnow().isoformat()}Z restart completed", flush=True)
+    except Exception as e:
+        print(f"[comfy] flag check error: {e}", flush=True)
 
 # ========== HTTP server (bridge + static files) ==========
 
@@ -645,7 +703,7 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
     files_range: bool = False
     dirs_map: Dict[str, str] = {}
 
-    server_version = "BridgeServer/1.5"
+    server_version = "BridgeServer/1.6"
     sys_version = ""
 
     def _set_common_headers(self, status: int, content_type: str, extra: Optional[Dict[str, str]] = None):
@@ -988,7 +1046,7 @@ def parse_stage1_args(argv=None):
     return p.parse_known_args(argv)
 
 def parse_stage2_args(argv=None):
-    p = argparse.ArgumentParser(description="Cloudflared Quick Tunnel URL Writer with LAN HTTP endpoint, optional FTPS upload, static file serving, health checks, FTPS soft restart flag, and .env support")
+    p = argparse.ArgumentParser(description="Cloudflared Quick Tunnel URL Writer with LAN HTTP endpoint, optional FTPS upload, static file serving, health checks, FTPS soft restart flag, local Comfy flag watcher, and .env support")
     # Primary settings
     p.add_argument("--cloudflared", type=str, default=os.getenv("CLOUDFLARED", ""), help="Path to cloudflared binary (auto-discover if empty or 'cloudflared')")
     p.add_argument("--comfy-url", type=str, default=os.getenv("COMFY_URL", "http://127.0.0.1:8188"), help="Local URL to expose via tunnel (e.g., ComfyUI or this bridge)")
@@ -1024,7 +1082,7 @@ def parse_stage2_args(argv=None):
     p.add_argument("--health-target", type=str, default=os.getenv("HEALTH_TARGET", ""), help="URL to poll for health checks (restart cloudflared on failures)")
     p.add_argument("--health-interval", type=int, default=int(os.getenv("HEALTH_INTERVAL", "15")), help="Health check interval seconds")
     p.add_argument("--health-threshold", type=int, default=int(os.getenv("HEALTH_THRESHOLD", "3")), help="Consecutive failures before restart")
-    p.add_argument("--ftps-restart-flag", type=str, default=os.getenv("FTPS_RESTART_FLAG", ""), help="Filename to watch on FTPS for remote-triggered restart (e.g., restart.flag)")
+    p.add_argument("--ftps-restart-flag", type=str, default=os.getenv("FTPS_RESTART_FLAG", ""), help="Filename to watch on FTPS for remote-triggered restart (e.g., restart.flag) for cloudflared")
     p.add_argument("--ftps-check-interval", type=int, default=int(os.getenv("FTPS_CHECK_INTERVAL", "30")), help="Seconds between FTPS checks")
 
     # Keep stage1 flags for help visibility
@@ -1105,6 +1163,22 @@ def main():
         flush=True,
     )
 
+    # Read local Comfy flag watcher ENV (after .env is loaded)
+    global COMFY_FLAG_WATCH_DIR, COMFY_FLAG_NAME, COMFY_SERVICE_NAME, COMFY_RESTART_CMD, COMFY_WATCH_INTERVAL
+    COMFY_FLAG_WATCH_DIR = os.getenv("COMFY_FLAG_WATCH_DIR", "").strip()
+    COMFY_FLAG_NAME = (os.getenv("COMFY_FLAG_NAME", "restart.flag").strip() or "restart.flag")
+    COMFY_SERVICE_NAME = (os.getenv("COMFY_SERVICE_NAME", "comfyui").strip() or "comfyui")
+    COMFY_RESTART_CMD = os.getenv("COMFY_RESTART_CMD", "").strip()
+    try:
+        COMFY_WATCH_INTERVAL = float(os.getenv("COMFY_WATCH_INTERVAL", "2.0"))
+    except Exception:
+        COMFY_WATCH_INTERVAL = 2.0
+
+    if COMFY_FLAG_WATCH_DIR:
+        print(f"[comfy] watch_dir={COMFY_FLAG_WATCH_DIR} flag={COMFY_FLAG_NAME} service={COMFY_SERVICE_NAME} interval={COMFY_WATCH_INTERVAL}", flush=True)
+    else:
+        print("[comfy] local flag watcher disabled (COMFY_FLAG_WATCH_DIR not set)", flush=True)
+
     # Validate FTPS config if enabled
     if args.ftps_enable:
         missing = []
@@ -1182,6 +1256,25 @@ def main():
         )
         flag_watcher.start()
 
+    # Local Comfy flag watcher thread (filesystem-based)
+    comfy_flag_thread = None
+    stop_local_watcher = threading.Event()
+    if COMFY_FLAG_WATCH_DIR:
+        os.makedirs(COMFY_FLAG_WATCH_DIR, exist_ok=True)
+
+        def _comfy_flag_loop():
+            print(f"[comfy] local watcher started dir={COMFY_FLAG_WATCH_DIR} flag={COMFY_FLAG_NAME} interval={COMFY_WATCH_INTERVAL}s", flush=True)
+            try:
+                while not stop_local_watcher.is_set():
+                    _check_and_handle_comfy_flag()
+                    # Minimum sleep to avoid busy-loop; configurable via COMFY_WATCH_INTERVAL
+                    time.sleep(max(0.5, COMFY_WATCH_INTERVAL))
+            except Exception as e:
+                print(f"[comfy] watcher thread error: {e}", flush=True)
+
+        comfy_flag_thread = threading.Thread(target=_comfy_flag_loop, daemon=True, name="ComfyFlagWatcher")
+        comfy_flag_thread.start()
+
     def handle_signal(signum, frame):
         print("[main] shutdown requested", flush=True)
         try:
@@ -1192,6 +1285,10 @@ def main():
         try:
             if health_watcher:
                 health_watcher.stop()
+        except Exception:
+            pass
+        try:
+            stop_local_watcher.set()
         except Exception:
             pass
         try:
@@ -1210,7 +1307,7 @@ def main():
     except Exception:
         pass
 
-    # Run writer loop (blocking) but keep HTTP server alive
+    # Run writer loop (blocking) but keep HTTP server and watchers alive
     try:
         tw.run_forever()
     finally:
@@ -1222,6 +1319,10 @@ def main():
         try:
             if health_watcher:
                 health_watcher.stop()
+        except Exception:
+            pass
+        try:
+            stop_local_watcher.set()
         except Exception:
             pass
         try:
