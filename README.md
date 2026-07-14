@@ -1,6 +1,24 @@
 ### Cloudflared Quick Tunnel URL Bridge
 
-I build this tool to get a cloudflared quicktunnel URL to use ComfyUI from my local network.
+I build this tool to reach two cloudflared quicktunnel URLs from remote to use ComfyUI hosted in my local network, and get pull the produced files.
+
+Start tunnel A to reach ComfyUI GUI over URL:
+
+    python cf_quicktunnel_writer.py
+
+-> https://your-host-adress.de/bridge/tunnel_url.json
+
+and tunnel B to GET the files produced:
+
+    python cf_quicktunnel_writer.py --env-file ".env.files"
+
+Here's your hosted cloudflared URL:
+-> https://your-host-adress.de/bridge/files/tunnel_url.json
+
+And here the files:
+-> https://your-cloudflared-url.trycloudflare.com/files/
+-> https://your-cloudflared-url.trycloudflare.com/files/3d
+-> https://your-cloudflared-url.trycloudflare.com/files/mesh
 
 -------------------------
 
@@ -38,7 +56,7 @@ This helps bypass CGNAT and router port forwarding by providing a stable locatio
 
 1) Install Cloudflared:
 - https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/
-- Place cloudflared.exe next to the script or ensure it’s on PATH.
+- Place the cloudflared.exe next to the script or ensure it’s on PATH.
 
 ----------------------
 -> Specify your cloudflared binary via .env or CLI (no need to edit the script):
@@ -76,9 +94,11 @@ Create a .env file next to the script (recommended):
 
     python cf_quicktunnel_writer.py
 
-The script auto-discovers .env next to the script. You can also pass a custom file:
+The script auto-discovers .env next to the script.
 
-    python cf_quicktunnel_writer.py --env-file ./.env
+Open a second tunnel to get the files:
+
+    python cf_quicktunnel_writer.py --env-file ".env.files"
 
 4) Check the local health endpoint:
 
