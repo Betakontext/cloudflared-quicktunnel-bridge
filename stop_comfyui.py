@@ -1,299 +1,273 @@
-﻿# stop_comfyui.ps1 (tunnel-safe micro + bind-probe)
-# Stops ComfyUI reliably with stale-lock handling, deterministic kill, and robust port verification
-# while leaving Cloudflared/Quicktunnel processes untouched.
-#
-# Enhancements over your baseline:
-# - Port usage detection counts only LISTENING/ESTABLISHED; transitional states ignored.
-# - Final bind-probe: if we can bind 127.0.0.1:<Port> briefly, the port is effectively free → success.
-# - Before exit 4, logs real LISTEN/ESTABLISHED holders (PID, process name, optional path).
-# - Lock cleanup remains guaranteed in finally.
-#
-# Exit codes:
-#   0 = success or already stopped
-#   2 = could not acquire lock (active other op)
-#   4 = port did not free in time (real listener stayed)
-#   5 = unexpected error
-#
-# Usage:
-#   powershell -ExecutionPolicy Bypass -File ".\stop_comfyui.ps1"
+﻿#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+stop_comfyui.py
+Trigger a soft stop of a remote ComfyUI instance by uploading a 'stop.flag'
+into the remote bridge directory dedicated to ComfyUI.
 
-[CmdletBinding()]
-param(
-  # Paths
-  [string]$ComfyRoot = "C:\Users\Administrator\Documents\Arbeiten\0000_DEV\ComfyUI",
-  [string]$LockFile = ".restart.lock",
+Exit codes:
+  0 = success
+  1 = upload failure or local temp error
+  2 = configuration error
+"""
 
-  # Network
-  [int]$Port = 8188,
+import argparse
+import os
+import sys
+import tempfile
+import time
+from datetime import datetime, timezone
+from ftplib import FTP_TLS
+from contextlib import contextmanager
+from typing import Optional
 
-  # Process match (used to identify Comfy python processes)
-  [string]$MainPy = "",  # optional; if empty, we match by ComfyRoot directory
-  [string]$ProcName = "python.exe",
+# ---------- .env loader ----------
 
-  # Timeouts
-  [int]$KillTimeoutSec = 20,
-  [int]$PortWaitTimeoutSec = 60,
+def _strip_quotes(value: str) -> str:
+    if (value.startswith('"') and value.endswith('"')) or (value.startswith("'") and value.endswith("'")):
+        return value[1:-1]
+    return value
 
-  # Logging
-  [string]$LogPrefix = "[comfy-stop]",
+def load_env_file(path: str, overwrite: bool = False) -> int:
+    set_count = 0
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for raw in f:
+                line = raw.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, val = line.split("=", 1)
+                key = key.strip()
+                val = _strip_quotes(val.strip())
+                if not key:
+                    continue
+                if overwrite or (key not in os.environ):
+                    os.environ[key] = val
+                    set_count += 1
+        return set_count
+    except FileNotFoundError:
+        return 0
+    except Exception as e:
+        print(f"[env] failed to load {path}: {e}", flush=True)
+        return 0
 
-  # Tuning flags
-  [int]$LockStaleSec = 180,       # consider lock stale after N seconds
-  [switch]$ForceUnlock = $false,  # remove existing lock unconditionally
-  [switch]$AggressivePortFree = $true # kill any process holding the port if initial wait fails
-)
+def auto_discover_env_file(script_dir: str, cwd: str) -> Optional[str]:
+    candidates = [os.path.join(script_dir, ".env")]
+    if os.path.abspath(cwd) != os.path.abspath(script_dir):
+        candidates.append(os.path.join(cwd, ".env"))
+    for p in candidates:
+        if os.path.isfile(p):
+            return p
+    return None
 
-# --------------- Utilities ---------------
+# ---------- helpers ----------
 
-function Write-Log {
-  param([string]$msg)
-  $ts = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
-  Write-Host "$LogPrefix $ts $msg"
-}
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-function Fail-And-Exit {
-  param([int]$code, [string]$msg)
-  Write-Log "ERROR: $msg"
-  throw [System.Exception]::new("EXIT_CODE::$code")
-}
+def atomic_write(path: str, data: bytes):
+    d = os.path.dirname(os.path.abspath(path)) or "."
+    base = os.path.basename(path)
+    fd, tmppath = tempfile.mkstemp(prefix=base + ".", suffix=".tmp", dir=d)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmppath, path)
+    except Exception:
+        try:
+            os.unlink(tmppath)
+        except Exception:
+            pass
+        raise
 
-function Resolve-MainPy {
-  param([string]$Root, [string]$Main)
-  if ([string]::IsNullOrWhiteSpace($Main)) {
-    return (Join-Path $Root "main.py")
-  }
-  return $Main
-}
+def _normalize_remote_dir(p: str) -> str:
+    # Ensure single leading slash and no trailing slash (except root)
+    if not p:
+        return ""
+    s = p.replace("//", "/")
+    if not s.startswith("/"):
+        s = "/" + s
+    if len(s) > 1 and s.endswith("/"):
+        s = s[:-1]
+    return s
 
-function Get-ComfyProcesses {
-  # Match python.exe processes whose CommandLine references main.py or its containing directory.
-  param([string]$MainPyPath, [string]$ProcNameFilter = "python.exe")
-  try {
-    $q = "SELECT ProcessId, CommandLine FROM Win32_Process WHERE Name='" + $ProcNameFilter + "'"
-    $procs = Get-WmiObject -Query $q -ErrorAction Stop
-    $mainDir = [System.IO.Path]::GetDirectoryName($MainPyPath)
-    $escMain = [Regex]::Escape($MainPyPath)
-    $escDir  = [Regex]::Escape($mainDir)
-    $matches = $procs | Where-Object {
-      $_.CommandLine -ne $null -and
-      ($_.CommandLine -match $escMain -or $_.CommandLine -match $escDir)
-    }
-    return $matches
-  } catch {
-    return @()
-  }
-}
+def _safe_filename(name: str, default: str = "stop.flag") -> str:
+    # Prevent path traversal and empty names
+    n = (name or default).strip()
+    if not n:
+        return default
+    if "/" in n or "\\" in n:
+        return default
+    return n
 
-function Stop-ByPidList {
-  param([int[]]$ProcIds, [int]$TimeoutSec = 20)
-  if (-not $ProcIds -or $ProcIds.Count -eq 0) { return $true }
-  Write-Log ("Stopping existing processes: " + ($ProcIds -join ', '))
-  foreach ($ProcId in $ProcIds) {
-    try { Stop-Process -Id $ProcId -Force -ErrorAction SilentlyContinue } catch {}
-  }
-  $sw = [System.Diagnostics.Stopwatch]::StartNew()
-  while ($sw.Elapsed.TotalSeconds -lt $TimeoutSec) {
-    Start-Sleep -Milliseconds 300
-    $still = @()
-    foreach ($ProcId in $ProcIds) {
-      try { if (Get-Process -Id $ProcId -ErrorAction SilentlyContinue) { $still += $ProcId } } catch {}
-    }
-    if ($still.Count -eq 0) { return $true }
-  }
-  $rem = @()
-  foreach ($ProcId in $ProcIds) {
-    try { if (Get-Process -Id $ProcId -ErrorAction SilentlyContinue) { $rem += $ProcId } } catch {}
-  }
-  if ($rem.Count -gt 0) {
-    Write-Log ("WARNING: Failed to stop PIDs within timeout: " + ($rem -join ', '))
-    # We continue; port check will decide
-  }
-  return $true
-}
+# ---------- FTPS helpers (stdlib) ----------
 
-# netstat helpers: only LISTENING/ESTABLISHED count as "in use"
-function Netstat-LinesForPort {
-  param([int]$p)
-  try {
-    return & netstat -ano | Select-String -Pattern (":$p\s")
-  } catch { return @() }
-}
+@contextmanager
+def ftps_connect(host: str, user: str, password: str, timeout: float = 25.0):
+    ftps = FTP_TLS()
+    # Optional: ftps.set_debuglevel(2)  # verbose debug when needed
+    ftps.connect(host=host, timeout=timeout)
+    ftps.auth()
+    ftps.prot_p()
+    # Passive mode is default in ftplib; keep it so unless you know you need active:
+    # ftps.set_pasv(True)
+    ftps.login(user=user, passwd=password)
+    try:
+        yield ftps
+    finally:
+        try:
+            ftps.quit()
+        except Exception:
+            try:
+                ftps.close()
+            except Exception:
+                pass
 
-function Test-PortFree {
-  param([int]$p)
-  $lines = Netstat-LinesForPort -p $p
-  if (-not $lines -or $lines.Count -eq 0) { return $true }
-  foreach ($line in $lines) {
-    $cols = ($line -replace '\s+', ' ').Trim().Split(' ')
-    # Expected: Proto LocalAddr ForeignAddr State PID
-    if ($cols.Count -ge 5) {
-      $state = $cols[$cols.Count - 2]
-      if ($state -match 'LISTENING|ESTABLISHED') { return $false }
-    }
-  }
-  return $true
-}
+def _ftps_mkdirs(ftps: FTP_TLS, remote_dir: str):
+    if not remote_dir or remote_dir == "/":
+        return
+    parts = [p for p in remote_dir.strip("/").split("/") if p]
+    try:
+        ftps.cwd("/")
+    except Exception:
+        pass
+    path_so_far = ""
+    for p in parts:
+        path_so_far = path_so_far + "/" + p
+        try:
+            ftps.cwd(path_so_far)
+        except Exception:
+            try:
+                ftps.mkd(path_so_far)
+            except Exception as e:
+                msg = str(e).lower()
+                if "exists" not in msg and "file unavailable" not in msg:
+                    raise
+            ftps.cwd(path_so_far)
 
-function Wait-PortFree {
-  param([int]$p, [int]$TimeoutSec)
-  Write-Log ("Waiting for port " + $p + " to become free (timeout " + $TimeoutSec + "s)...")
-  $sw = [System.Diagnostics.Stopwatch]::StartNew()
-  while ($sw.Elapsed.TotalSeconds -lt $TimeoutSec) {
-    if (Test-PortFree -p $p) { Write-Log ("Port " + $p + " is free."); return $true }
-    Start-Sleep -Milliseconds 350
-  }
-  return (Test-PortFree -p $p)
-}
+def ftps_upload_file(host: str, user: str, password: str, local_path: str, remote_dir: str, remote_filename: str, timeout: float = 25.0):
+    with ftps_connect(host, user, password, timeout=timeout) as ftps:
+        _ftps_mkdirs(ftps, remote_dir)
+        if remote_dir and remote_dir != "/":
+            ftps.cwd(remote_dir)
+        with open(local_path, "rb") as lf:
+            ftps.storbinary(f"STOR {remote_filename}", lf)
 
-function Get-PortHolderPids {
-  param([int]$p)
-  $pids = @()
-  $lines = Netstat-LinesForPort -p $p
-  foreach ($line in $lines) {
-    $cols = ($line -replace '\s+', ' ').Trim().Split(' ')
-    if ($cols.Count -ge 5) {
-      $state = $cols[$cols.Count - 2]
-      $pidStr = $cols[$cols.Count - 1]
-      if ($state -match 'LISTENING|ESTABLISHED' -and $pidStr -match '^\d+$') {
-        $pids += [int]$pidStr
-      }
-    }
-  }
-  return ($pids | Sort-Object -Unique)
-}
+def upload_with_retries(host: str, user: str, password: str, local_path: str, remote_dir: str, remote_filename: str, retries: int = 5, base_delay: float = 1.0, timeout: float = 25.0) -> bool:
+    attempt = 0
+    last_exc: Optional[Exception] = None
+    while attempt < retries:
+        try:
+            ftps_upload_file(host, user, password, local_path, remote_dir, remote_filename, timeout=timeout)
+            print(f"[ftps] uploaded -> {host}:{remote_dir}/{remote_filename}", flush=True)
+            return True
+        except Exception as e:
+            last_exc = e
+            delay = base_delay * (1.7 ** attempt)
+            # Added granular error hint for common FTPS issues
+            hint = ""
+            emsg = str(e).lower()
+            if "ssl" in emsg or "tls" in emsg:
+                hint = " (hint: FTPS/TLS negotiation issue; check explicit FTPS, firewall, or try passive mode)"
+            elif "timed out" in emsg or "timeout" in emsg:
+                hint = " (hint: increase --ftps-timeout or FTPS_TIMEOUT)"
+            elif "530" in emsg:
+                hint = " (hint: auth failed; verify FTPS_USER/FTPS_PASS)"
+            elif "550" in emsg:
+                hint = " (hint: path/permissions; verify FTPS_DIR/COMFY_FLAG_REMOTE_DIR)"
+            print(f"[ftps] upload failed (attempt {attempt+1}/{retries}): {e}{hint}; retrying in {delay:.1f}s", flush=True)
+            time.sleep(delay)
+            attempt += 1
+    print(f"[ftps] upload permanently failed: {last_exc}", flush=True)
+    return False
 
-function Log-PortHolders {
-  param([int]$p)
-  $holders = Get-PortHolderPids -p $p
-  if ($holders -and $holders.Count -gt 0) {
-    Write-Log ("Port " + $p + " held by PIDs: " + ($holders -join ', '))
-    foreach ($pid in $holders) {
-      try {
-        $proc = Get-Process -Id $pid -ErrorAction SilentlyContinue
-        if ($proc) {
-          $path = $null; try { $path = $proc.Path } catch {}
-          Write-Log ("Holder PID " + $pid + " => " + $proc.ProcessName + (if ($path) { " [$path]" } else { "" }))
-        }
-      } catch {}
-    }
-  } else {
-    Write-Log ("No LISTEN/ESTABLISHED holders detected; likely transitional states only.")
-  }
-}
+# ---------- main ----------
 
-# Final authoritative check: try to bind the port briefly. If we can bind, the port is free.
-function Try-BindProbe {
-  param([int]$p)
-  try {
-    $listener = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, $p)
-    $listener.Start()
-    $listener.Stop()
-    return $true
-  } catch {
-    return $false
-  }
-}
+def parse_args(argv=None):
+    p = argparse.ArgumentParser(description="Trigger remote ComfyUI stop by uploading stop.flag to COMFY_FLAG_REMOTE_DIR (or FTPS_DIR/comfy)")
+    p.add_argument("--env-file", type=str, default="", help="Path to .env file to load before execution")
+    p.add_argument("--no-auto-env", action="store_true", help="Disable .env auto-discovery")
+    p.add_argument("--flag-name", type=str, default="stop.flag", help="Flag filename to upload (default: stop.flag)")
+    p.add_argument("--message", type=str, default="", help="Optional note included in flag content")
+    p.add_argument("--retries", type=int, default=int(os.getenv("FTPS_RETRIES", "5")), help="Upload retries")
+    p.add_argument("--ftps-timeout", type=float, default=float(os.getenv("FTPS_TIMEOUT", "25")), help="FTPS timeout seconds")
+    return p.parse_args(argv)
 
-# --------------- Main ---------------
+def main():
+    # Load .env
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    cwd = os.getcwd()
+    args = parse_args()
 
-$lockPath = $null
-$lockCreated = $false
-try {
-  # Validate paths
-  if (-not (Test-Path $ComfyRoot)) {
-    Write-Log ("ComfyRoot not found: " + $ComfyRoot + " → assuming not running.")
-    exit 0
-  }
-  $resolvedMain = Resolve-MainPy -Root $ComfyRoot -Main $MainPy
+    if args.env_file:
+        cnt = load_env_file(args.env_file, overwrite=False)
+        print(f"[env] loaded {cnt} keys from {args.env_file}", flush=True)
+    elif not args.no_auto_env:
+        auto_env = auto_discover_env_file(script_dir, cwd)
+        if auto_env:
+            cnt = load_env_file(auto_env, overwrite=False)
+            print(f"[env] auto-loaded {cnt} keys from {auto_env}", flush=True)
+        else:
+            print("[env] no .env discovered", flush=True)
+    else:
+        print("[env] auto-discovery disabled", flush=True)
 
-  # Acquire/remove stale lock
-  $lockPath = Join-Path $ComfyRoot $LockFile
-  if (Test-Path $lockPath) {
-    Write-Log ("Lock file exists at " + $lockPath + ". Checking staleness...")
-    if ($ForceUnlock) {
-      Write-Log "FORCE_UNLOCK set → removing existing lock."
-      Remove-Item $lockPath -ErrorAction SilentlyContinue
-    } else {
-      $ageSec = [int]((Get-Date) - (Get-Item $lockPath).LastWriteTime).TotalSeconds
-      if ($ageSec -gt $LockStaleSec) {
-        Write-Log ("Lock is stale (age " + $ageSec + "s > " + $LockStaleSec + "s). Removing.")
-        Remove-Item $lockPath -ErrorAction SilentlyContinue
-      } else {
-        Fail-And-Exit 2 ("Another operation in progress (lock: " + $lockPath + ", age " + $ageSec + "s)")
-      }
-    }
-  }
-  New-Item -ItemType File -Path $lockPath -Force | Out-Null
-  $lockCreated = $true
-  Write-Log ("Acquired lock: " + $lockPath)
+    host = os.getenv("FTPS_HOST", "").strip()
+    user = os.getenv("FTPS_USER", "").strip()
+    pwd = os.getenv("FTPS_PASS", "")
+    base_remote_dir = os.getenv("FTPS_DIR", "").strip()
+    comfy_remote_dir = os.getenv("COMFY_FLAG_REMOTE_DIR", "").strip() or (f"{base_remote_dir.rstrip('/')}/comfy" if base_remote_dir else "")
+    comfy_remote_dir = _normalize_remote_dir(comfy_remote_dir)  # normalization
 
-  # Detect and stop Comfy-related processes (tunnels remain untouched)
-  $existing = Get-ComfyProcesses -MainPyPath $resolvedMain -ProcNameFilter $ProcName
-  if ($existing.Count -eq 0) {
-    Write-Log "No matching ComfyUI processes found."
-  } else {
-    $pids = ($existing | Select-Object -ExpandProperty ProcessId)
-    if (-not (Stop-ByPidList -ProcIds $pids -TimeoutSec $KillTimeoutSec)) {
-      Write-Log "WARNING: Some processes may still be running."
-    }
-  }
+    flag_name = _safe_filename(args.flag_name or "stop.flag", default="stop.flag")
 
-  # Wait for port to free (ignores transitional states)
-  $portFree = Wait-PortFree -p $Port -TimeoutSec $PortWaitTimeoutSec
+    # Validate
+    missing = []
+    if not host: missing.append("FTPS_HOST")
+    if not user: missing.append("FTPS_USER")
+    if not pwd: missing.append("FTPS_PASS")
+    if not comfy_remote_dir: missing.append("COMFY_FLAG_REMOTE_DIR (or FTPS_DIR for fallback)")
+    if missing:
+        print(f"[main] config error: missing {', '.join(missing)}", flush=True)
+        sys.exit(2)
 
-  # If still not free, try to clear explicit LISTEN/ESTABLISHED holders (if allowed)
-  if (-not $portFree -and $AggressivePortFree) {
-    Write-Log "Port still not free → attempting to kill explicit LISTEN/ESTABLISHED holders."
-    Log-PortHolders -p $Port
-    $holders = Get-PortHolderPids -p $Port
-    if ($holders -and $holders.Count -gt 0) {
-      foreach ($pid in $holders) {
-        try { Stop-Process -Id $pid -Force -ErrorAction SilentlyContinue } catch {
-          Write-Log ("WARNING: Failed to kill PID " + $pid + ": " + $_.Exception.Message)
-        }
-      }
-      Start-Sleep -Seconds 2
-    }
-    $portFree = Test-PortFree -p $Port
-  }
+    # Create local flag file content
+    note = args.message.strip()
+    content = f"comfyui stop requested at {utc_now_iso()}"
+    if note:
+        content += f"\nmessage: {note}"
+    content_bytes = (content + "\n").encode("utf-8")
 
-  # Final bind-probe: if we can bind, then the port is effectively free
-  if (-not $portFree) {
-    if (Try-BindProbe -p $Port) {
-      Write-Log ("Bind-probe succeeded; port " + $Port + " is effectively free.")
-      $portFree = $true
-    }
-  }
+    # Write temp file
+    tmp_dir = tempfile.gettempdir()
+    local_flag_path = os.path.join(tmp_dir, f"{flag_name}.tmp-upload")
+    try:
+        atomic_write(local_flag_path, content_bytes)
+    except Exception as e:
+        print(f"[main] failed to prepare local flag: {e}", flush=True)
+        sys.exit(1)
 
-  if (-not $portFree) {
-    # Final diagnostics before exit
-    Log-PortHolders -p $Port
-    Fail-And-Exit 4 ("Port " + $Port + " did not free within " + $PortWaitTimeoutSec + "s.")
-  }
+    print(f"[flag] uploading '{flag_name}' to {host}:{comfy_remote_dir}", flush=True)
+    ok = upload_with_retries(
+        host, user, pwd,
+        local_flag_path, comfy_remote_dir, flag_name,
+        retries=max(1, int(args.retries)),
+        base_delay=1.0,
+        timeout=float(args.ftps_timeout),
+    )
 
-  Write-Log "Stop completed successfully."
-  exit 0
+    try:
+        os.unlink(local_flag_path)
+    except Exception:
+        pass
 
-} catch {
-  # Parse our Fail-And-Exit code if present
-  $code = 5
-  $msg = $_.Exception.Message
-  if ($msg -like "EXIT_CODE::*") {
-    try { $code = [int]($msg.Split("::")[-1]) } catch {}
-  } elseif ($msg -like "*EXIT_CODE::*") {
-    try { $code = [int]($msg.Substring($msg.LastIndexOf("EXIT_CODE::") + 10)) } catch {}
-  } else {
-    # keep default
-  }
-  Write-Log ("Aborting with code " + $code + ". Reason: " + $msg)
-  exit $code
+    if ok:
+        print("[flag] done", flush=True)
+        sys.exit(0)
+    else:
+        sys.exit(1)
 
-} finally {
-  # Always cleanup lock to prevent stuck lifecycle
-  try {
-    if ($lockCreated -and (Test-Path $lockPath)) {
-      Remove-Item $lockPath -ErrorAction SilentlyContinue
-      Write-Log ("Lock removed in finally: " + $lockPath)
-    }
-  } catch {}
-}
+if __name__ == "__main__":
+    main()
