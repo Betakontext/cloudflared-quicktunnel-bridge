@@ -1,197 +1,149 @@
 ### Cloudflared Quick Tunnel URL Bridge
 
-Access a local ComfyUI instance and its generated files through Cloudflare Quick Tunnels—even behind CGNAT, without router port forwarding.
+## Overview
 
-The script detects each tunnel URL, saves it locally, and optionally publishes it to your webspace via FTPS. Remote applications fetch a stable discovery JSON to find the current address.
+A small standard-library Python bridge for publishing and discovering Cloudflared Quick Tunnel URLs for local ComfyUI and, optionally, its output files. Cloudflared is required. Quick Tunnels have **no authentication**: anything exposed is public.
 
-**Python standard library only. Requires cloudflared. No built-in authentication.**
+The supplied lifecycle senders upload FTPS flags using Python’s standard library. They do not run remote commands. Python **3.10+** is required by the supplied restart sender annotations.
 
-#### Architecture
+## Workspace layout
 
-Run two instances with separate configurations:
+```text
+workspace/
+├── ComfyUI/                         # main.py, .venv/, output/
+└── cloudflared-quicktunnel-bridge/
+    ├── cf_quicktunnel_writer.py      # bridge watcher
+    ├── restart_bridge.py             # existing sender
+    ├── restart_comfyui.py            # existing sender
+    ├── stop_comfyui.py               # existing sender
+    ├── stop_bridge.py                # new: root stop request only
+    ├── cloudflared-windows-amd64.exe
+    ├── .env
+    ├── .env.files
+    └── bridge_output/
+```
 
-| Instance | Tunnel target | Discovery URL |
-|---|---|---|
-| A: ComfyUI | `http://127.0.0.1:8188` | `https://your-host.example/bridge/tunnel_url.json` |
-| B: Files | `http://127.0.0.1:8800` | `https://your-host.example/bridge/files/tunnel_url.json` |
+Keep the bridge directory beside `ComfyUI` when using relative paths. An empty `CLOUDFLARED=` uses the executable beside the bridge script.
 
-FTPS publishes the addresses only. Application traffic and downloads pass through the tunnels.
+## Dotenv examples
 
-#### Requirements
+Dotenv uses separate-line comments; no interpolation is performed. Existing process environment values win. For the existing senders, arguments are parsed **before** dotenv loading, so dotenv `FTPS_RETRIES` and `FTPS_TIMEOUT` do not change their argparse defaults: pass them explicitly on the command line. The new `stop_bridge.py` loads dotenv before resolving those two defaults.
 
-- Python compatible with the script.
-- cloudflared installed locally or available on `PATH`.
-- Running ComfyUI instance.
-- Optional: explicit FTPS hosting with publicly accessible HTTPS discovery files.
+### A — ComfyUI (`.env`)
 
-#### Configuration
+```dotenv
+CLOUDFLARED=
+COMFY_URL=http://127.0.0.1:8188
+HTTP_PORT=8799
+OUT_DIR=bridge_output/comfy
+HTTP_CORS=false
+EDGE_PROTOCOL=http2
+FILES_ENABLE=false
+COMFY_ROOT=../ComfyUI
+COMFY_RESTART_CMD=powershell.exe -NoProfile -File ".\restart_comfyui.ps1" -ForceStop -LowVRAM
+COMFY_STOP_CMD=powershell.exe -NoProfile -File ".\stop_comfyui.ps1" -ForceStop
+FTPS_HOST=ftp.example.com
+FTPS_USER=your-user
+FTPS_PASS=your-password
+FTPS_DIR=/web-root/bridge
+FTPS_RETRIES=5
+```
 
-Create `.env` for Tunnel A:
+### B — files (`.env.files`)
 
-    CLOUDFLARED=.\cloudflared-windows-amd64.exe
-    COMFY_URL=http://127.0.0.1:8188
-    OUT_DIR=./bridge_output/comfy
-    HTTP_HOST=127.0.0.1
-    HTTP_PORT=8799
-    HTTP_CORS=false
-    EDGE_PROTOCOL=http2
-    FILES_ENABLE=false
-    FTPS_ENABLE=true
-    FTPS_HOST=ftp.your-host.example
-    FTPS_USER=your-user
-    FTPS_PASS=your-password
-    FTPS_DIR=/your-web-root/bridge
-    FTPS_RETRIES=5
+```dotenv
+CLOUDFLARED=
+COMFY_URL=http://127.0.0.1:8800
+HTTP_PORT=8800
+OUT_DIR=bridge_output/files
+HTTP_CORS=false
+EDGE_PROTOCOL=http2
+FILES_ENABLE=true
+FILES_ROOT=../ComfyUI/output
+FILES_INDEX=true
+FILES_RANGE=true
+FTPS_HOST=ftp.example.com
+FTPS_USER=your-user
+FTPS_PASS=your-password
+FTPS_DIR=/web-root/bridge/files
+FTPS_RETRIES=5
+```
 
-Create `.env.files` for Tunnel B:
+`FILES_ROOT` is relative to the bridge directory. Example A tunnels ComfyUI at 8188; local bridge port 8799 is not tunneled through 8188.
 
-    CLOUDFLARED=.\cloudflared-windows-amd64.exe
-    COMFY_URL=http://127.0.0.1:8800
-    OUT_DIR=./bridge_output/files
-    HTTP_HOST=127.0.0.1
-    HTTP_PORT=8800
-    HTTP_CORS=false
-    EDGE_PROTOCOL=http2
-    FILES_ENABLE=true
-    FILES_ROOT=C:/path/to/ComfyUI/output
-    FILES_INDEX=true
-    FILES_RANGE=true
-    FTPS_ENABLE=true
-    FTPS_HOST=ftp.your-host.example
-    FTPS_USER=your-user
-    FTPS_PASS=your-password
-    FTPS_DIR=/your-web-root/bridge/files
-    FTPS_RETRIES=5
+## Start and reload
 
-Adjust paths and hosting credentials. On Linux/macOS, configure the appropriate cloudflared executable.
+Use separate terminals for both modes. After changing dotenv, stop the bridge with Ctrl+C and relaunch it; root flags do not restart Python or reload dotenv.
 
-**Important:**
+```powershell
+python cf_quicktunnel_writer.py --env-file .env
+python cf_quicktunnel_writer.py --env-file .env.files
+```
 
-- Use separate HTTP ports, output directories, and FTPS directories.
-- Tunnel B's `COMFY_URL` must point to its own bridge HTTP server.
-- Public HTTPS paths depend on your hosting configuration.
-- Set `FTPS_ENABLE=false` to disable publishing.
-- Put `.env` comments on separate lines; inline comments are not supported.
-- Existing environment variables take precedence over `.env` values.
+For portable lifecycle scripts, apply any path resolution change after their `param` block and ensure the bridge runs commands with bridge-directory cwd. This is a required implementation detail, not confirmation that such a patch is already present.
 
-#### Run
+## Flag senders
 
-Start ComfyUI, then launch each instance in a separate terminal:
+```powershell
+python restart_comfyui.py --env-file .env --message 'Restart ComfyUI'
+python stop_comfyui.py --env-file .env --message 'Stop ComfyUI'
+python restart_bridge.py --env-file .env --message 'Restart bridge'
+python restart_bridge.py --env-file .env.files --message 'Restart files bridge'
+python stop_bridge.py --env-file .env --message 'Stop tunnel request'
+python stop_bridge.py --env-file .env.files --message 'Stop files tunnel request'
+```
 
-    python cf_quicktunnel_writer.py
+```bash
+python3 restart_comfyui.py --env-file .env --message 'Restart ComfyUI'
+python3 stop_comfyui.py --env-file .env --message 'Stop ComfyUI'
+python3 restart_bridge.py --env-file .env --message 'Restart bridge'
+python3 restart_bridge.py --env-file .env.files --message 'Restart files bridge'
+python3 stop_bridge.py --env-file .env --message 'Stop tunnel request'
+```
 
-    python cf_quicktunnel_writer.py --env-file ".env.files"
+### Root stop is pending server support
 
-Show available options:
+**Do not treat `stop_bridge.py` as ready remote tunnel control.** It uploads only root `stop.flag` and requires a compatible new server-side root-stop handler. Such support is **not verified or established** by the provided watcher evidence/source. Request/provide the bridge source and handler design before using it operationally. No configuration names are assumed or invented here.
 
-    python cf_quicktunnel_writer.py --help
+A root stop should be intended to stop the tunnel only while leaving Python alive, which requires the server implementation to suppress auto-restart/watchdog behavior, clear restart handling so a later start is possible, and invalidate/remove stale discovery on a true stop. Stopping ComfyUI does not stop its tunnel. A full Python-process restart is separate from flags.
 
-Each instance writes `tunnel_url.json` and `tunnel_url.txt` to its output directory.
+## Flags and observed behavior
 
-JSON format:
+```text
+bridge/
+├── restart.flag                 # root action
+├── stop.flag                    # pending root-stop handler only
+├── comfy/
+│   ├── restart.flag
+│   └── stop.flag
+└── files/
+    └── restart.flag
+```
 
-    {
-      "url": "https://example.trycloudflare.com",
-      "updated_at": "2026-11-14T17:34:08Z"
-    }
+Provided watcher evidence supports `comfy/restart.flag`, `comfy/stop.flag`, and root `restart.flag`; it does **not** establish root stop. Root restart is `cloudflared` or `both` according to the bridge’s existing configuration/implementation; do not infer a setting name. Logs showed `both` for A and `cloudflared` for B. Flags may be consumed before action success. Allow about 30 seconds and inspect logs. Upload success means only the request uploaded, never readiness or action success. `-ForceStop` interrupts jobs.
 
-#### Remote access
+## Discovery and routes
 
-Fetch the appropriate discovery JSON and use its `url` as the base address.
+Discovery paths are deployment-dependent placeholders, not invented source facts: consult the bridge implementation for actual paths. Typical documents contain a Quick Tunnel URL and update time; refresh after tunnel restart because URLs change. `/health` is bridge-only, not ComfyUI health. With files enabled, routes include images, 3d, mesh, and video; `?list=json` depends on `FILES_INDEX=true`. Range support depends on `FILES_RANGE=true`.
 
-Tunnel A provides ComfyUI access.
+## FTPS, exits, and safety
 
-Tunnel B provides file routes:
+FTPS is not SFTP. `stop_bridge.py` uses `ssl.create_default_context()` with `FTP_TLS(context=...)`, port 21, protected data connection, passive mode, an existing absolute `FTPS_DIR`, and certificate verification. The existing sender examples use FTPS flags, but their TLS verification behavior must be reviewed; do not assume it matches the new sender. The new sender rejects unsafe names/paths, retries with capped exponential backoff, and deletes its temporary flag automatically.
 
-| Route | Default directory |
-|---|---|
-| `/files/images/` | `FILES_ROOT` |
-| `/files/3d/` | `FILES_ROOT/3d` |
-| `/files/mesh/` | `FILES_ROOT/mesh` |
-| `/files/video/` | `FILES_ROOT/video` |
+Uploader exits: `0` uploaded, `1` transfer/local error, `2` configuration error. Existing lifecycle scripts use their own semantics: `0` success, `1` failure, `2` already running. No sender can prove the requested lifecycle action happened.
 
-Examples:
+## `.gitignore`
 
-    /files/images/example.png
-    /files/3d/example.glb
-    /files/images/?list=json
-    /files/mesh/?list=json
+```gitignore
+.env
+.env.files
+!.env.example
+!.env.files.example
+bridge_output/
+__pycache__/
+*.pyc
+```
 
-Directory listings require `FILES_INDEX=true`. There is no combined listing at `/files/`.
+## License and contact
 
-The `images` route does not filter file types. Only configure directories intended for sharing.
-
-#### Bridge endpoints
-
-Available on each instance's configured HTTP port:
-
-- `/bridge/tunnel_url.json`
-- `/bridge/tunnel_url.txt`
-- `/health`
-- `/`
-
-`/health` reports process state, not end-to-end ComfyUI or tunnel readiness.
-
-`HTTP_CORS=true` affects the bridge server only, not ComfyUI exposed through Tunnel A.
-
-#### Security and limitations
-
-- Public tunnel addresses are not authentication. Protect ComfyUI and file access separately.
-- Keep credentials private and run with minimal permissions.
-- FTPS is explicit FTP over TLS, not SFTP.
-- Review TLS certificate verification before production use.
-- Quick Tunnel addresses can change after restarts.
-- Discovery files can become stale; `updated_at` is not a heartbeat.
-- FTPS uploads currently block tunnel-log reading during retries.
-- Failed uploads are not continuously rescheduled.
-- Remote files are overwritten directly rather than published atomically.
-- Refresh discovery data after connection failures.
-- Do not blindly resend generation requests after timeouts.
-
-For permanent deployments, consider a named tunnel with a fixed hostname and an access-control layer.
-
-#### Troubleshooting
-
-| Problem | Check |
-|---|---|
-| cloudflared not found | Executable path or `PATH` |
-| HTTP port already in use | Different `HTTP_PORT` per instance |
-| Tunnel B opens ComfyUI | Set its target to `http://127.0.0.1:8800` |
-| Discovery files overwrite each other | Separate `OUT_DIR` and `FTPS_DIR` |
-| FTPS `451` write error | Hosting space, quota, permissions, server logs |
-| `/files/` returns `404` | Use a category route |
-| Logs pause during upload | Upload retries currently block log reading |
-
-#### Git hygiene
-
-Recommended `.gitignore`:
-
-    .env
-    .env.*
-    !.env.example
-    !.env.files.example
-    bridge_output/
-    __pycache__/
-    *.py[cod]
-
-If credentials were committed, rotate them—even after removing the files.
-
-#### GitHub topics
-
-`python`, `comfyui`, `cloudflared`, `cloudflare-tunnel`, `quick-tunnel`, `cgnat`, `remote-access`, `ftps`, `service-discovery`, `file-server`
-
-#### Suggested issue labels
-
-`bug`, `enhancement`, `documentation`, `security`, `cloudflared`, `ftps`, `file-server`, `comfyui`, `configuration`, `reliability`, `windows`, `linux`, `macos`, `good first issue`, `help wanted`
-
-Report security vulnerabilities privately.
-
-#### License and contact
-
-MIT — see `LICENSE`.
-
-Provided as-is. Follow your Cloudflare and hosting provider terms.
-
-- Contact: dev@betakontext.de
-- Website: https://dev.betakontext.de
-- Support: https://buymeacoffee.com/betakontext
+MIT License. Contact: [dev@betakontext.de](mailto:dev@betakontext.de) · <https://dev.betakontext.de> · <https://buymeacoffee.com/betakontext>

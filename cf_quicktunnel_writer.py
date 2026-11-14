@@ -519,7 +519,9 @@ COMFY_WATCH_INTERVAL = 2.0
 def _exec_shell_cmd(cmd: str, label: str) -> bool:
     try:
         print(f"[comfy] {label} via custom cmd: {cmd}", flush=True)
-        subprocess.run(cmd, shell=True, check=True)
+        # Resolve relative command paths against the bridge directory.
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        subprocess.run(cmd, shell=True, check=True, cwd=script_dir)
         return True
     except Exception as e:
         print(f"[comfy] {label} failed: {e}", flush=True)

@@ -5,7 +5,10 @@ __pycache__/
 .venv/
 venv/
 .env
+.env00
 .env.files
+.env.files00
+restart_bridge00.py
 
 # OS
 .DS_Store
