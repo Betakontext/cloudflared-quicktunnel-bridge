@@ -1,359 +1,381 @@
-﻿# restart_comfyui.ps1 (stale-lock resilient, no redirection)
-# Starts ComfyUI if not running, or restarts it when invoked by your flag watcher.
-# - Stale-lock auto-removal (> ShortStaleSec, default 45s)
-# - Deterministic kill of existing Comfy processes
-# - Port wait with targeted holder kill
-# - SQLite .wal/.shm cleanup
-# - Start without stdout/stderr redirection to avoid tqdm/logger errors
-# - TCP health check; optional raw-HTTP confirm
-#
-# Exit codes:
-#   0 = success
-#   1 = invalid arguments/paths
-#   2 = could not acquire lock
-#   3 = failed to stop existing processes
-#   4 = port did not free in time
-#   5 = start failed (process did not launch)
-#   6 = health check failed
-#   7 = unexpected error
-#
-# Usage:
-#   powershell -ExecutionPolicy Bypass -File ".\restart_comfyui.ps1"
+﻿# restart_comfyui.ps1
+# Local ComfyUI lifecycle management for Windows.
+# Requires Windows PowerShell 5.1 or PowerShell 7.
+# Exit codes: 0 success, 1 failure, 2 operation already running.
+# ForceStop interrupts active jobs. SQLite files are never deleted.
 
 [CmdletBinding()]
 param(
-  # Paths
-  [string]$ComfyRoot = "C:\Users\Administrator\Documents\Arbeiten\0000_DEV\ComfyUI",
-  [string]$VenvPython = "C:\Users\Administrator\Documents\Arbeiten\0000_DEV\ComfyUI\.venv\Scripts\python.exe",
-  [string]$MainPy = "",
+    [ValidateSet("Restart", "Stop")]
+    [string]$Action = "Restart",
 
-  # Network
-  [string]$Listen = "0.0.0.0",
-  [int]$Port = 8188,
+    [string]$ComfyRoot = "",
+    [string]$VenvPython = "",
+    [string]$MainPy = "",
 
-  # Args
-  [switch]$LowVRAM = $true,
-  [switch]$DisableAutoLaunch = $true,
-  [string]$DatabaseUrl = "",   # e.g. sqlite:///C:/path/to/comfyui_main.db
+    [ValidateRange(1, 65535)]
+    [int]$Port = 8188,
 
-  # Health (TCP-based)
-  [int]$HealthTimeoutSec = 120,
-  [int]$HealthRetryDelaySec = 2,
-  [int]$HealthInitialDelaySec = 1,
-  [switch]$HttpConfirm = $false,
+    [ValidateSet("127.0.0.1", "0.0.0.0")]
+    [string]$Listen = "127.0.0.1",
 
-  # Timeouts
-  [int]$KillTimeoutSec = 20,
-  [int]$PortWaitTimeoutSec = 60,
+    [switch]$LowVRAM,
+    [switch]$ForceStop,
 
-  # Lock + Logging
-  [string]$LockFile = ".restart.lock",
-  [string]$LogPrefix = "[comfy-restart]",
+    [ValidateRange(5, 3600)]
+    [int]$HealthTimeoutSec = 180,
 
-  # Tuning flags
-  [int]$LockStaleSec = 180,  # legacy, kept for compatibility
-  [int]$ShortStaleSec = 45,
-  [switch]$ForceUnlock = $false,
-  [switch]$AggressivePortFree = $true
+    [ValidateRange(1, 300)]
+    [int]$StopTimeoutSec = 30
 )
 
-function Write-Log { param([string]$msg)
-  $ts = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
-  Write-Host "$LogPrefix $ts $msg"
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+
+$exitCode = 1
+$mutex = $null
+$lockAcquired = $false
+
+function Write-Log {
+    param([string]$Message)
+
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    Write-Host "[comfy-$($Action.ToLowerInvariant())] $timestamp $Message"
 }
 
-function Fail-And-Exit { param([int]$code, [string]$msg)
-  Write-Log "ERROR: $msg"
-  throw [System.Exception]::new("EXIT_CODE::$code")
-}
+function Resolve-RequiredPath {
+    param(
+        [string]$Path,
+        [ValidateSet("Leaf", "Container")]
+        [string]$Type
+    )
 
-function Resolve-MainPy { param([string]$Root, [string]$Main)
-  if ([string]::IsNullOrWhiteSpace($Main)) { return (Join-Path $Root "main.py") }
-  return $Main
-}
-
-function Get-ComfyProcesses { param([string]$MainPyPath)
-  try {
-    $q = "SELECT ProcessId, CommandLine FROM Win32_Process WHERE Name='python.exe'"
-    $procs = Get-WmiObject -Query $q -ErrorAction Stop
-    $mainDir = [System.IO.Path]::GetDirectoryName($MainPyPath)
-    $escMain = [Regex]::Escape($MainPyPath)
-    $escDir  = [Regex]::Escape($mainDir)
-    $procs | Where-Object { $_.CommandLine -ne $null -and ($_.CommandLine -match $escMain -or $_.CommandLine -match $escDir) }
-  } catch { @() }
-}
-
-function Stop-ComfyProcesses { param([int[]]$ProcIds, [int]$TimeoutSec = 20)
-  if (-not $ProcIds -or $ProcIds.Count -eq 0) { return $true }
-  Write-Log ("Stopping existing ComfyUI processes: " + ($ProcIds -join ', '))
-  foreach ($ProcId in $ProcIds) { try { Stop-Process -Id $ProcId -Force -ErrorAction SilentlyContinue } catch {} }
-  $sw = [System.Diagnostics.Stopwatch]::StartNew()
-  while ($sw.Elapsed.TotalSeconds -lt $TimeoutSec) {
-    Start-Sleep -Milliseconds 300
-    $still = @()
-    foreach ($ProcId in $ProcIds) {
-      try { if (Get-Process -Id $ProcId -ErrorAction SilentlyContinue) { $still += $ProcId } } catch {}
+    if (-not (Test-Path -LiteralPath $Path -PathType $Type)) {
+        throw "Required path not found: $Path"
     }
-    if ($still.Count -eq 0) { return $true }
-  }
-  $rem = @()
-  foreach ($ProcId in $ProcIds) { try { if (Get-Process -Id $ProcId -ErrorAction SilentlyContinue) { $rem += $ProcId } } catch {} }
-  if ($rem.Count -gt 0) { Write-Log ("Failed to stop PIDs: " + ($rem -join ', ')); return $false }
-  return $true
+
+    return (Resolve-Path -LiteralPath $Path).ProviderPath
 }
 
-function Netstat-LinesForPort { param([int]$p)
-  try { & netstat -ano | Select-String -Pattern (":$p\s") } catch { @() }
-}
+function Get-ComfyProcesses {
+    param([string]$MainPath)
 
-function Test-PortFree { param([int]$p)
-  $lines = Netstat-LinesForPort -p $p
-  if (-not $lines -or $lines.Count -eq 0) { return $true }
-  foreach ($line in $lines) {
-    $cols = ($line -replace '\s+', ' ').Trim().Split(' ')
-    if ($cols.Count -ge 5) {
-      $state = $cols[$cols.Count - 2]
-      if ($state -match 'LISTENING|ESTABLISHED') { return $false }
-    }
-  }
-  return $true
-}
+    # Require an exact absolute main.py argument.
+    # Do not match arbitrary processes containing only the directory name.
+    $escaped = [regex]::Escape($MainPath)
+    $pattern = '(?i)(?:^|\s)(?:"' + $escaped +
+        '"|' + $escaped + ')(?=\s|$)'
 
-function Wait-PortFree { param([int]$p, [int]$TimeoutSec)
-  Write-Log ("Waiting for port " + $p + " to become free (timeout " + $TimeoutSec + "s)...")
-  $sw = [System.Diagnostics.Stopwatch]::StartNew()
-  while ($sw.Elapsed.TotalSeconds -lt $TimeoutSec) {
-    if (Test-PortFree -p $p) { Write-Log ("Port " + $p + " is free."); return $true }
-    Start-Sleep -Milliseconds 350
-  }
-  return (Test-PortFree -p $p)
-}
+    # Include pythonw.exe, but never match unrelated executable names.
+    # Do not restrict ExecutablePath: a venv launcher may use base Python.
+    $processes = Get-CimInstance -ClassName Win32_Process `
+        -Filter "Name = 'python.exe' OR Name = 'pythonw.exe'" `
+        -ErrorAction Stop
 
-function Get-PortHolderPids { param([int]$p)
-  $pids = @()
-  $lines = Netstat-LinesForPort -p $p
-  foreach ($line in $lines) {
-    $cols = ($line -replace '\s+', ' ').Trim().Split(' ')
-    if ($cols.Count -ge 5) {
-      $state = $cols[$cols.Count - 2]
-      $pidStr = $cols[$cols.Count - 1]
-      if ($state -match 'LISTENING|ESTABLISHED' -and $pidStr -match '^\d+$') { $pids += [int]$pidStr }
-    }
-  }
-  ($pids | Sort-Object -Unique)
-}
-
-function Kill-PortHolders { param([int]$p, [switch]$Force)
-  $pids = Get-PortHolderPids -p $p
-  if (-not $pids -or $pids.Count -eq 0) { Write-Log ("No explicit LISTEN/ESTABLISHED holders for " + $p + " found."); return }
-  Write-Log ("Killing port " + $p + " holders: " + ($pids -join ', ') + " (force=" + $Force.IsPresent + ")")
-  foreach ($pid in $pids) {
-    try {
-      if ($Force) { Stop-Process -Id $pid -Force -ErrorAction Stop } else { Stop-Process -Id $pid -ErrorAction Stop }
-    } catch { Write-Log ("WARNING: Failed to kill PID " + $pid + ": " + $_.Exception.Message) }
-  }
-}
-
-function Cleanup-SQLite-Journals { param([string]$Root)
-  try {
-    $userDir = Join-Path $Root "user"
-    $wal = Join-Path $userDir "comfyui.db-wal"
-    $shm = Join-Path $userDir "comfyui.db-shm"
-    if (Test-Path $wal) { Remove-Item $wal -ErrorAction SilentlyContinue }
-    if (Test-Path $shm) { Remove-Item $shm -ErrorAction SilentlyContinue }
-    Write-Log "SQLite journals cleaned (.wal/.shm removed if present)."
-  } catch { Write-Log ("WARNING: SQLite cleanup error: " + $_.Exception.Message) }
-}
-
-function Start-Comfy {
-  param(
-    [string]$VenvPythonPath,
-    [string]$WorkingDir,
-    [string]$MainPyPath,
-    [string]$ListenAddr,
-    [int]$ListenPort,
-    [switch]$LowVRAM,
-    [switch]$DisableAutoLaunch,
-    [string]$DatabaseUrl
-  )
-  $argList = @()
-  $argList += ('"' + $MainPyPath + '"')
-  $argList += "--listen"; $argList += $ListenAddr
-  $argList += "--port";   $argList += "$ListenPort"
-  if ($LowVRAM) { $argList += "--lowvram" }
-  if ($DisableAutoLaunch) { $argList += "--disable-auto-launch" }
-  if ($DatabaseUrl -and $DatabaseUrl.Trim() -ne "") { $argList += "--database-url"; $argList += $DatabaseUrl }
-
-  Write-Log "Starting ComfyUI..."
-  Write-Log ("Venv: " + $VenvPythonPath)
-  Write-Log ("Args: " + ($argList -join ' '))
-
-  $psi = New-Object System.Diagnostics.ProcessStartInfo
-  $psi.FileName = $VenvPythonPath
-  $psi.WorkingDirectory = $WorkingDir
-  $psi.Arguments = ($argList -join ' ')
-  $psi.UseShellExecute = $false   # keep as false for precise control; no redirection configured
-  $psi.CreateNoWindow = $false
-  # Optional: better log flushing when attached to console
-  try { $psi.Environment["PYTHONUNBUFFERED"] = "1" } catch {}
-
-  $proc = New-Object System.Diagnostics.Process
-  $proc.StartInfo = $psi
-  $null = $proc.Start()
-  Write-Log ("ComfyUI started. ProcId=" + $proc.Id + ", listen=" + $ListenAddr + ", port=" + $ListenPort)
-  return $proc
-}
-
-function Test-TcpReady { param([string]$TcpHost, [int]$Port, [int]$TimeoutMs = 800)
-  try {
-    $client = New-Object System.Net.Sockets.TcpClient
-    $iar = $client.BeginConnect($TcpHost, $Port, $null, $null)
-    $ok = $iar.AsyncWaitHandle.WaitOne($TimeoutMs)
-    if ($ok -and $client.Connected) { $client.Close(); return $true }
-    else { try { $client.Close() } catch {}; return $false }
-  } catch { return $false }
-}
-
-function Wait-HealthyTcp {
-  param([string]$TcpHost,[int]$Port,[int]$TimeoutSec,[int]$RetryDelaySec,[int]$InitialDelaySec)
-  if ($InitialDelaySec -gt 0) { Start-Sleep -Seconds $InitialDelaySec }
-  Write-Log ("TCP health-check on " + $TcpHost + ":" + $Port + " (timeout " + $TimeoutSec + "s, retry " + $RetryDelaySec + "s)")
-  $sw = [System.Diagnostics.Stopwatch]::StartNew()
-  while ($sw.Elapsed.TotalSeconds -lt $TimeoutSec) {
-    if (Test-TcpReady -TcpHost $TcpHost -Port $Port -TimeoutMs 800) { Write-Log ("TCP ready on " + $TcpHost + ":" + $Port); return $true }
-    Start-Sleep -Seconds $RetryDelaySec
-  }
-  return $false
-}
-
-function Http-Confirm { param([string]$TcpHost,[int]$Port,[string]$Path = "/")
-  try {
-    $client = New-Object System.Net.Sockets.TcpClient($TcpHost, $Port)
-    $stream = $client.GetStream()
-    $writer = New-Object System.IO.StreamWriter($stream); $writer.NewLine = "`r`n"; $writer.AutoFlush = $true
-    $request = "GET $Path HTTP/1.1`r`nHost: $TcpHost`r`nConnection: close`r`n`r`n"
-    $writer.Write($request)
-    $buffer = New-Object byte[] 512
-    $read = $stream.Read($buffer, 0, $buffer.Length)
-    $client.Close()
-    if ($read -gt 0) {
-      $header = [System.Text.Encoding]::ASCII.GetString($buffer, 0, [Math]::Min($read, 128))
-      if ($header -match "^HTTP/\d\.\d\s+(\d{3})") {
-        $code = [int]$Matches[1]
-        return ($code -ge 200 -and $code -lt 500)
-      }
-    }
-    return $false
-  } catch { return $false }
-}
-
-# --------------- Main ---------------
-
-$lockPath = $null
-$lockCreated = $false
-try {
-  # Resolve and validate
-  $MainPy = Resolve-MainPy -Root $ComfyRoot -Main $MainPy
-  if (-not (Test-Path $ComfyRoot)) { Fail-And-Exit 1 ("ComfyRoot not found: " + $ComfyRoot) }
-  if (-not (Test-Path $VenvPython)) { Fail-And-Exit 1 ("Venv Python not found: " + $VenvPython) }
-  if (-not (Test-Path $MainPy)) { Fail-And-Exit 1 ("main.py not found: " + $MainPy) }
-
-  # Lock
-  $lockPath = Join-Path $ComfyRoot $LockFile
-  if (Test-Path $lockPath) {
-    Write-Log ("Lock file exists at " + $lockPath + ". Checking staleness...")
-    $ageSec = [int]((Get-Date) - (Get-Item $lockPath).LastWriteTime).TotalSeconds
-    if ($ForceUnlock) {
-      Write-Log "FORCE_UNLOCK set → removing existing lock."
-      Remove-Item $lockPath -ErrorAction SilentlyContinue
-    } elseif ($ageSec -gt $ShortStaleSec) {
-      Write-Log ("Lock age " + $ageSec + "s > " + $ShortStaleSec + "s → stale. Removing.")
-      Remove-Item $lockPath -ErrorAction SilentlyContinue
-    } else {
-      Write-Log ("Lock fresh (age " + $ageSec + "s ≤ " + $ShortStaleSec + "s). Waiting 2s and retrying once...")
-      Start-Sleep -Seconds 2
-      if (Test-Path $lockPath) {
-        $ageSec2 = [int]((Get-Date) - (Get-Item $lockPath).LastWriteTime).TotalSeconds
-        if ($ageSec2 -gt $ShortStaleSec) {
-          Write-Log ("After wait, lock age " + $ageSec2 + "s > " + $ShortStaleSec + "s → removing.")
-          Remove-Item $lockPath -ErrorAction SilentlyContinue
-        } else {
-          Fail-And-Exit 2 ("Another restart in progress (lock: " + $lockPath + ", age " + $ageSec2 + "s)")
+    foreach ($process in $processes) {
+        if (
+            $process.CommandLine -and
+            $process.CommandLine -match $pattern
+        ) {
+            $process
         }
-      }
     }
-  }
-  New-Item -ItemType File -Path $lockPath -Force | Out-Null
-  $lockCreated = $true
-  Write-Log ("Acquired lock: " + $lockPath)
-
-  # Stop existing
-  $existing = Get-ComfyProcesses -MainPyPath $MainPy
-  if ($existing.Count -gt 0) {
-    $procIds = ($existing | Select-Object -ExpandProperty ProcessId)
-    if (-not (Stop-ComfyProcesses -ProcIds $procIds -TimeoutSec $KillTimeoutSec)) {
-      Fail-And-Exit 3 "Failed to stop some ComfyUI processes."
-    }
-  } else {
-    Write-Log "No existing ComfyUI processes found."
-  }
-
-  # Ensure port free
-  $portFree = Wait-PortFree -p $Port -TimeoutSec $PortWaitTimeoutSec
-  if (-not $portFree -and $AggressivePortFree) {
-    Write-Log "Port still not free → killing explicit LISTEN/ESTABLISHED holders and retrying shortly."
-    Kill-PortHolders -p $Port -Force
-    Start-Sleep -Seconds 2
-    $portFree = Test-PortFree -p $Port
-  }
-  if (-not $portFree) { Fail-And-Exit 4 ("Port " + $Port + " did not free within " + $PortWaitTimeoutSec + "s.") }
-
-  # DB cleanup
-  Cleanup-SQLite-Journals -Root $ComfyRoot
-
-  # Start
-  try {
-    $proc = Start-Comfy -VenvPythonPath $VenvPython -WorkingDir $ComfyRoot -MainPyPath $MainPy -ListenAddr $Listen -ListenPort $Port -LowVRAM:$LowVRAM -DisableAutoLaunch:$DisableAutoLaunch -DatabaseUrl $DatabaseUrl
-  } catch {
-    Fail-And-Exit 5 ("Failed to start ComfyUI: " + $_.Exception.Message)
-  }
-
-  # Health
-  $tcpHost = "127.0.0.1"
-  $ok = Wait-HealthyTcp -TcpHost $tcpHost -Port $Port -TimeoutSec $HealthTimeoutSec -RetryDelaySec $HealthRetryDelaySec -InitialDelaySec $HealthInitialDelaySec
-  if (-not $ok) {
-    try { if ($proc -and -not $proc.HasExited) { $proc.Kill() | Out-Null } } catch {}
-    Fail-And-Exit 6 ("TCP health-check failed for " + $tcpHost + ":" + $Port)
-  }
-
-  if ($HttpConfirm) {
-    if (-not (Http-Confirm -TcpHost $tcpHost -Port $Port -Path "/")) {
-      Write-Log "TCP ready but HTTP confirm did not return 200–499; proceeding anyway."
-    } else {
-      Write-Log "HTTP confirm succeeded."
-    }
-  }
-
-  Write-Log ("ComfyUI is healthy (TCP) at " + $tcpHost + ":" + $Port)
-
-  # Success
-  if ($lockCreated -and (Test-Path $lockPath)) { Remove-Item $lockPath -ErrorAction SilentlyContinue }
-  $lockCreated = $false
-  exit 0
-
-} catch {
-  $code = 7
-  $msg = $_.Exception.Message
-  if ($msg -like "EXIT_CODE::*") { try { $code = [int]($msg.Split("::")[-1]) } catch {} }
-  elseif ($msg -like "*EXIT_CODE::*") { try { $code = [int]($msg.Substring($msg.LastIndexOf("EXIT_CODE::") + 10)) } catch {} }
-  Write-Log ("Aborting with code " + $code + ". Reason: " + $msg)
-  exit $code
-
-} finally {
-  try {
-    if ($lockCreated -and (Test-Path $lockPath)) {
-      Remove-Item $lockPath -ErrorAction SilentlyContinue
-      Write-Log ("Lock removed in finally: " + $lockPath)
-    }
-  } catch {}
 }
+
+function Test-PortFree {
+    param([int]$LocalPort)
+
+    # Only local TCP listeners matter; ignore TIME_WAIT and remote ports.
+    $properties = [System.Net.NetworkInformation.IPGlobalProperties]::GetIPGlobalProperties()
+    $listeners = $properties.GetActiveTcpListeners()
+    $matching = @($listeners | Where-Object { $_.Port -eq $LocalPort })
+
+    return ($matching.Count -eq 0)
+}
+
+function Wait-PortFree {
+    param(
+        [int]$LocalPort,
+        [int]$TimeoutSec
+    )
+
+    $timer = [System.Diagnostics.Stopwatch]::StartNew()
+
+    while ($timer.Elapsed.TotalSeconds -lt $TimeoutSec) {
+        if (Test-PortFree -LocalPort $LocalPort) {
+            return $true
+        }
+        Start-Sleep -Milliseconds 300
+    }
+
+    return (Test-PortFree -LocalPort $LocalPort)
+}
+
+function Stop-VerifiedProcess {
+    param(
+        [object]$Candidate,
+        [string]$MainPath,
+        [int]$TimeoutSec
+    )
+
+    $processId = [int]$Candidate.ProcessId
+    $target = Get-Process -Id $processId -ErrorAction SilentlyContinue
+
+    if ($null -eq $target) {
+        return
+    }
+
+    try {
+        # Acquire a handle before rechecking process identity.
+        try {
+            $null = $target.Handle
+        }
+        catch {
+            if ($target.HasExited) {
+                return
+            }
+            throw
+        }
+
+        $verified = @(Get-ComfyProcesses -MainPath $MainPath |
+            Where-Object {
+                [int]$_.ProcessId -eq $processId -and
+                $_.CreationDate -eq $Candidate.CreationDate
+            })
+
+        if ($verified.Count -ne 1) {
+            if ($target.HasExited) {
+                return
+            }
+            throw "Identity check failed for PID $processId; refusing termination."
+        }
+
+        if ($target.HasExited) {
+            return
+        }
+
+        Write-Log "Terminating verified ComfyUI process $processId."
+
+        try {
+            $target.Kill()
+        }
+        catch {
+            if (-not $target.HasExited) {
+                throw
+            }
+        }
+
+        if (-not $target.WaitForExit($TimeoutSec * 1000)) {
+            throw "Process $processId did not exit within $TimeoutSec seconds."
+        }
+    }
+    finally {
+        $target.Dispose()
+    }
+}
+
+try {
+    # Resolve configuration after parameter binding.
+    if ([string]::IsNullOrWhiteSpace($ComfyRoot)) {
+        $ComfyRoot = $env:COMFY_ROOT
+    }
+
+    if ([string]::IsNullOrWhiteSpace($ComfyRoot)) {
+        $ComfyRoot = Join-Path $PSScriptRoot "../ComfyUI"
+    }
+
+    # Anchor relative paths to this script, not the working directory.
+    if (-not [System.IO.Path]::IsPathRooted($ComfyRoot)) {
+        $ComfyRoot = Join-Path $PSScriptRoot $ComfyRoot
+    }
+
+    $ComfyRoot = Resolve-RequiredPath -Path $ComfyRoot -Type Container
+
+
+    if ([string]::IsNullOrWhiteSpace($MainPy)) {
+        $MainPy = Join-Path $ComfyRoot "main.py"
+    }
+    $MainPy = Resolve-RequiredPath -Path $MainPy -Type Leaf
+
+    # Stop mode does not require an existing Python environment.
+    if ($Action -eq "Restart") {
+        if ([string]::IsNullOrWhiteSpace($VenvPython)) {
+            $VenvPython = Join-Path $ComfyRoot ".venv\Scripts\python.exe"
+        }
+        $VenvPython = Resolve-RequiredPath -Path $VenvPython -Type Leaf
+    }
+
+    # Both actions share one machine-wide mutex per ComfyUI root.
+    # No lock files or age-based lock deletion are needed.
+    $hasher = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $rootKey = $ComfyRoot.TrimEnd('\', '/').ToLowerInvariant()
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($rootKey)
+        $hash = [System.BitConverter]::ToString(
+            $hasher.ComputeHash($bytes)
+        ).Replace("-", "")
+    }
+    finally {
+        $hasher.Dispose()
+    }
+
+    $mutex = [System.Threading.Mutex]::new(
+        $false, "Global\ComfyUIBridge_$hash"
+    )
+
+    try {
+        $lockAcquired = $mutex.WaitOne(0)
+    }
+    catch [System.Threading.AbandonedMutexException] {
+        # An abandoned mutex is now owned by this process.
+        $lockAcquired = $true
+    }
+
+    if (-not $lockAcquired) {
+        $exitCode = 2
+        throw "Another ComfyUI stop/restart operation is already running."
+    }
+
+    Write-Log "Acquired operation mutex."
+
+    $existing = @(Get-ComfyProcesses -MainPath $MainPy)
+
+    if ($existing.Count -gt 0) {
+        if (-not $ForceStop) {
+            throw (
+                "ComfyUI is running. Use -ForceStop to permit termination. " +
+                "Active jobs will be interrupted."
+            )
+        }
+
+        foreach ($candidate in $existing) {
+            Stop-VerifiedProcess -Candidate $candidate `
+                -MainPath $MainPy -TimeoutSec $StopTimeoutSec
+        }
+    }
+    else {
+        Write-Log "No matching ComfyUI processes found."
+    }
+
+    Write-Log "Waiting for local TCP port $Port to become free."
+
+    if (-not (Wait-PortFree -LocalPort $Port -TimeoutSec $StopTimeoutSec)) {
+        throw (
+            "Port $Port still has a listener. No unknown process was terminated. " +
+            "Inspect its owner; ComfyUI started with a relative main.py argument " +
+            "is intentionally not matched."
+        )
+    }
+
+    if ($Action -eq "Stop") {
+        Write-Log "ComfyUI is stopped; port $Port has no TCP listener."
+        $exitCode = 0
+    }
+    else {
+        $arguments = @(
+            "`"$MainPy`"",
+            "--listen", $Listen,
+            "--port", "$Port",
+            "--disable-auto-launch"
+        )
+
+        if ($LowVRAM) {
+            $arguments += "--lowvram"
+        }
+
+        $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+        $startInfo.FileName = $VenvPython
+        $startInfo.WorkingDirectory = $ComfyRoot
+        $startInfo.Arguments = $arguments -join " "
+        $startInfo.UseShellExecute = $false
+        $startInfo.CreateNoWindow = $false
+        $startInfo.EnvironmentVariables["PYTHONUNBUFFERED"] = "1"
+
+        # Inherit console output without stdout/stderr redirection.
+        $started = New-Object System.Diagnostics.Process
+
+        try {
+            $started.StartInfo = $startInfo
+
+            Write-Log "Starting ComfyUI using $VenvPython"
+            Write-Log "Arguments: $($startInfo.Arguments)"
+
+            if (-not $started.Start()) {
+                throw "Failed to launch ComfyUI."
+            }
+
+            Write-Log "Launcher PID: $($started.Id)"
+
+            # This request stays on the local machine.
+            $healthUrl = "http://127.0.0.1:$Port/system_stats"
+            $timer = [System.Diagnostics.Stopwatch]::StartNew()
+            $ready = $false
+
+            while ($timer.Elapsed.TotalSeconds -lt $HealthTimeoutSec) {
+                # A venv launcher may exit while a matching child remains alive.
+                if ($started.HasExited) {
+                    $remaining = @(Get-ComfyProcesses -MainPath $MainPy)
+                    if ($remaining.Count -eq 0) {
+                        throw "ComfyUI exited before becoming ready."
+                    }
+                }
+
+                try {
+                    $response = Invoke-WebRequest -Uri $healthUrl `
+                        -UseBasicParsing -TimeoutSec 3 `
+                        -MaximumRedirection 0 -ErrorAction Stop
+
+                    if ([int]$response.StatusCode -eq 200) {
+                        $stats = $response.Content | ConvertFrom-Json
+
+                        if (
+                            $null -ne $stats -and
+                            $null -ne $stats.PSObject.Properties["system"]
+                        ) {
+                            $ready = $true
+                            break
+                        }
+                    }
+                }
+                catch {
+                    # Startup may take time while custom nodes are loading.
+                }
+
+                Start-Sleep -Seconds 2
+            }
+
+            if (-not $ready) {
+                throw (
+                    "HTTP readiness check timed out. No process was killed. " +
+                    "Inspect the ComfyUI console before retrying."
+                )
+            }
+
+            Write-Log "ComfyUI responds at http://127.0.0.1:$Port."
+            $exitCode = 0
+        }
+        finally {
+            # Disposing the handle does not terminate ComfyUI.
+            $started.Dispose()
+        }
+    }
+}
+catch {
+    Write-Log "ERROR: $($_.Exception.Message)"
+}
+finally {
+    if ($lockAcquired -and $null -ne $mutex) {
+        try {
+            $mutex.ReleaseMutex()
+        }
+        catch {
+            Write-Warning "Could not release mutex: $($_.Exception.Message)"
+        }
+    }
+
+    if ($null -ne $mutex) {
+        $mutex.Dispose()
+    }
+}
+
+exit $exitCode
