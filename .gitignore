@@ -5,10 +5,7 @@ __pycache__/
 .venv/
 venv/
 .env
-.env00
 .env.files
-.env.files00
-restart_bridge00.py
 
 # OS
 .DS_Store
@@ -24,6 +21,10 @@ cloudflared-windows-amd64.exe
 # Previous Versions
 cf_quicktunnel_writer00.py
 cf_quicktunnel_writer01.py
+.env.files00
+restart_bridge00.py
+tunnel_control00.py
+.env00
 
 # Temp folders
 bridge_output_files/
