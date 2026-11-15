@@ -1351,5 +1351,9 @@ def main():
             pass
         print("[main] stopped", flush=True)
 
+from tunnel_control import install
+install(globals())
+
 if __name__ == "__main__":
     main()
+
