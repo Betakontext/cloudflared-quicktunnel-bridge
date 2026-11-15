@@ -335,13 +335,13 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 return self._send(200, b"Cloudflared URL bridge\n")
             body = (
                 "<!doctype html><html lang='de'><meta charset='utf-8'>"
-                "<title>Freigegebene Ordner</title>"
-                "<h1>Freigegebene Ordner</h1><ul>"
+                "<title>Shared folders in comfyui/output</title>"
+                "<h1>Shared folders in comfyui/output</h1><ul>"
                 "<li><a href='/files/images/'>Bilder</a></li>"
                 "<li><a href='/files/3d/'>3D</a></li>"
                 "<li><a href='/files/mesh/'>Mesh</a></li>"
                 "<li><a href='/files/video/?'>Videos</a></li>"
-                "</ul><p>Ordnerinhalte werden als JSON angezeigt.</p></html>"
+                "</ul><p></p></html>"
             )
             return self._send(200, body.encode("utf-8"), "text/html; charset=utf-8")
 
