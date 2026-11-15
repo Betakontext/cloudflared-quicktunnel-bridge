@@ -2,41 +2,31 @@
 
 A small, standard-library Python bridge that publishes Cloudflared Quick Tunnel URLs for a local ComfyUI instance and, optionally, its output files.
 
-It can publish discovery data locally and through FTPS, and can poll an FTPS mailbox for tunnel and Comfy lifecycle requests.
+Supports local and FTPS URL discovery, remote tunnel controls, separate ComfyUI lifecycle requests, and a browser-based file list with downloads and on-demand image previews.
 
-This README is a complete replacement guide for the current bridge helpers, control patch, and senders.
+### Important Security Notice
 
-### Important security notice
-
-Cloudflared is required.
-
-Quick Tunnels have no built-in authentication.
-
-An exposed route is public unless you protect it separately.
-
-Treat published ComfyUI and file URLs as Internet-facing endpoints.
-
-FTPS is not SFTP: the senders use FTPS on port 21.
-
-The inspected newer sources use Python's default verified TLS certificate context.
-
-Do not disable certificate verification.
-
-Protect the FTP account and dotenv credentials as secrets.
-
-Stopping a tunnel or ComfyUI does not delete generated data.
+- Cloudflared is required.
+- This bridge does not provide authentication for public tunnel routes.
+- Treat published ComfyUI and file URLs as Internet-facing endpoints.
+- FTPS is not SFTP: control requests use FTPS on port 21.
+- Keep TLS certificate verification enabled and protect dotenv credentials.
+- ComfyUI lifecycle commands are trusted local shell configuration.
+- Stopping a tunnel or ComfyUI does not delete generated files.
 
 ### Requirements
 
-* Python 3.10 or newer is required for the supplied `restart_files.py` annotation syntax.
-* A working `cloudflared` executable is required on the receiver machine.
-* ComfyUI and this bridge are local sibling directories.
-* An FTPS account is optional for URL publication and remote controls, but required for those features.
-* Existing remote directories must be listable/writable/deletable by that FTPS account.
+- Python 3.10 or newer.
+- A working `cloudflared` executable on the receiver.
+- A running ComfyUI instance for the main tunnel.
+- An FTPS account for remote controls and URL publication.
+- Existing FTPS control directories with list, upload, and delete permissions.
 
-### Workspace layout
+No additional Python packages are required for the current file browser.
 
-Keep the directories as siblings. Run bridge commands from the bridge directory.
+### Workspace Layout
+
+Run the commands below from `bridge/`.
 
 ```text
 workspace/
@@ -44,67 +34,73 @@ workspace/
 │   ├── main.py
 │   ├── .venv/
 │   └── output/
+│       ├── 3d/
+│       ├── mesh/
+│       └── video/
 └── bridge/
     ├── cf_quicktunnel_writer.py
-    ├── tunnel_control.py
     ├── bridge_control.py
     ├── stop_bridge.py
     ├── restart_bridge.py
-    ├── restart_files.py
-    ├── stop_files.py
-    ├── restart_comfyui.py
-    ├── stop_comfyui.py
     ├── stop_all.py
     ├── restart_all.py
-    ├── restart_comfyui.ps1
+    ├── stop_files.py
+    ├── restart_files.py
+    ├── stop_comfyui.py
+    ├── restart_comfyui.py
     ├── stop_comfyui.ps1
+    ├── restart_comfyui.ps1
     ├── cloudflared-windows-amd64.exe
     ├── .env
     ├── .env.files
     └── bridge_output/
+        ├── comfy/
+        │   ├── tunnel_url.json
+        │   └── tunnel_url.txt
+        └── files/
+            ├── tunnel_url.json
+            └── tunnel_url.txt
 ```
 
-Relative paths below are resolved from `bridge/`.
+### Merged Control Implementation
 
-An empty `CLOUDFLARED=` means the original setup uses the executable beside the bridge directory.
+`tunnel_control.py` is no longer required. Do not install the old control patch in the merged writer.
 
-Do not assume platform executable autodetection.
+`bridge_control.py` remains required by `stop_bridge.py` and `restart_bridge.py` on the sender machine.
 
-### Install the corrected control patch
+The receiver does not import `bridge_control.py`.
 
-Apply the corrected `tunnel_control.py` integration to the writer source.
+### Cloudflared Executable
 
-Classes must already be defined before installing the patch.
+With the executable-discovery correction applied, an empty `CLOUDFLARED=` searches beside the script:
 
-Immediately before the existing main guard, add:
+- Windows: `cloudflared-windows-amd64.exe`, then `cloudflared.exe`.
+- Linux/macOS: `cloudflared`.
+- Otherwise, falls back to `cloudflared` through `PATH`.
 
-```python
-from tunnel_control import install
-install(globals())
+An explicitly configured executable overrides discovery. Prefer an absolute path:
 
-if __name__ == '__main__':
-    main()
+```dotenv
+CLOUDFLARED=C:/Tools/cloudflared/cloudflared-windows-amd64.exe
 ```
 
-The installation is additive and does not itself start a service.
+### Main Receiver Profile: `.env`
 
-The corrected patch prevents repeated Comfy restarts; install it rather than relying on an older pasted variant.
-
-### Main receiver profile: `.env`
-
-Create this file in `bridge/` and replace the example FTPS credentials.
+Replace the FTPS credentials and verify the local PowerShell script arguments.
 
 ```dotenv
 CLOUDFLARED=
 COMFY_URL=http://127.0.0.1:8188
+HTTP_HOST=127.0.0.1
 HTTP_PORT=8799
 OUT_DIR=bridge_output/comfy
 HTTP_CORS=false
 EDGE_PROTOCOL=http2
 FILES_ENABLE=false
-COMFY_ROOT=../ComfyUI
+
 COMFY_RESTART_CMD=powershell.exe -NoProfile -File ".\restart_comfyui.ps1" -ForceStop -LowVRAM
 COMFY_STOP_CMD=powershell.exe -NoProfile -File ".\stop_comfyui.ps1" -ForceStop
+
 FTPS_ENABLE=true
 FTPS_HOST=ftp.example.com
 FTPS_USER=your-user
@@ -112,6 +108,7 @@ FTPS_PASS=your-password
 FTPS_DIR=/web-root/bridge
 FTPS_RETRIES=5
 FTPS_TIMEOUT=30
+FTPS_CHECK_INTERVAL=10
 FTPS_RESTART_FLAG=restart.flag
 FTPS_TUNNEL_STOP_FLAG=stop.flag
 FTPS_FLAG_ACTION=both
@@ -119,25 +116,34 @@ FTPS_COMFY_SUBDIR=comfy
 FTPS_STOP_FLAG_NAME=stop.flag
 ```
 
-`FTPS_FLAG_ACTION=both` is essential for the all-sender main profile; it is the default when absent in those sources, but set it explicitly.
+Set `FTPS_FLAG_ACTION=both` explicitly to enable tunnel and ComfyUI requests.
 
-`HTTP_PORT=8799` is the bridge HTTP server, not a tunnel through ComfyUI at port 8188.
+`HTTP_PORT=8799` is the bridge HTTP server. The main tunnel forwards to ComfyUI at `COMFY_URL`.
 
-### Files receiver profile: `.env.files`
+For Linux/macOS receivers, replace the PowerShell lifecycle commands with suitable local commands.
 
-This is a standalone receiver profile for the optional output-file bridge.
+### Files Receiver Profile: `.env.files`
+
+This is an independent receiver profile.
 
 ```dotenv
 CLOUDFLARED=
 COMFY_URL=http://127.0.0.1:8800
+HTTP_HOST=127.0.0.1
 HTTP_PORT=8800
 OUT_DIR=bridge_output/files
 HTTP_CORS=false
 EDGE_PROTOCOL=http2
+
 FILES_ENABLE=true
 FILES_ROOT=../ComfyUI/output
+FILES_IMAGES_DIR=../ComfyUI/output
+FILES_3D_DIR=../ComfyUI/output/3d
+FILES_MESH_DIR=../ComfyUI/output/mesh
+FILES_VIDEO_DIR=../ComfyUI/output/video
 FILES_INDEX=true
 FILES_RANGE=true
+
 FTPS_ENABLE=true
 FTPS_HOST=ftp.example.com
 FTPS_USER=your-user
@@ -146,114 +152,108 @@ FTPS_DIR=/web-root/bridge/files
 FTPS_FILES_DIR=/web-root/bridge/files
 FTPS_RETRIES=5
 FTPS_TIMEOUT=30
+FTPS_CHECK_INTERVAL=10
 FTPS_RESTART_FLAG=restart.flag
 FTPS_TUNNEL_STOP_FLAG=stop.flag
 FTPS_FLAG_ACTION=cloudflared
 ```
 
-`FILES_ROOT` is relative to the bridge directory.
+Adjust shared directories to match your setup.
 
-`FTPS_FILES_DIR` is an explicit sender target for dedicated files senders.
+`FTPS_FILES_DIR` is a sender setting; it does not replace the receiver's `FTPS_DIR`.
 
-It is a sender hint and does not replace the receiver's `FTPS_DIR`.
+Keep ports, output directories, and FTPS directories distinct between profiles.
 
-Keep `OUT_DIR`, HTTP ports, and FTPS directories distinct between profiles.
+Sharing `ComfyUI/output` also exposes its reachable subdirectories. Use a dedicated images directory if necessary.
 
-### Dotenv rules and precedence
+### Receiver Configuration Rules
 
-Dotenv parsing supports separate-line comments and simple `KEY=VALUE` entries.
+With the profile-loader correction applied:
 
-Quoted values are unquoted; no interpolation or command execution is performed.
+- `--env-file .env.files` loads only `.env.files`.
+- Without `--env-file`, the receiver loads `.env` beside the script.
+- Existing process environment values override dotenv values.
+- Explicit command-line settings override corresponding environment settings.
+- Relative receiver configuration paths are resolved against the script directory.
+- Dotenv supports simple assignments, matching quotes, and separate-line comments.
+- No variable interpolation or inline-comment removal is performed.
 
-Restart the relevant Python bridge after a dotenv change. FTPS flags do not reload dotenv.
+Restart the Python receiver after configuration changes. Tunnel restart flags do not reload dotenv.
 
-For `stop_all.py` and `restart_all.py`, the main configuration is base dotenv followed by process environment.
+Sender configuration precedence differs by helper; do not assume receiver rules apply to every sender.
 
-The files overlay then wins only for the files target.
+### Start the Receiver Bridges
 
-`stop_files.py` uses the same base, environment, and overlay model.
-
-`bridge_control.py` instead makes values in each profile win over process environment.
-
-Its standalone profiles do not automatically inherit an overlay.
-
-With no `--env-file`, `bridge_control.py` uses the two profiles next to the helper.
-
-It accepts repeated `--env-file`; no arguments target both tunnel profiles only, never Comfy.
-
-The supplied pasted `restart_files.py` loads base dotenv with an existing process environment winning, then overwrites with the files overlay.
-
-For its target it uses `FTPS_FILES_DIR`, else blindly appends `/files` to post-overlay `FTPS_DIR`.
-
-That fallback can produce `/files/files`; set `FTPS_FILES_DIR` explicitly.
-
-`restart_files.py` parses argparse before dotenv loading, so dotenv retry/timeout defaults come only from the pre-existing process environment.
-
-Use explicit `--retries` and `--ftps-timeout` for predictable values.
-
-Its supplied `FTPS_TLS` path has no explicit verified SSL context; do not claim verified certificates for it.
-
-New `stop_files.py`, all senders, the helper, and the corrected patch use a default verified context.
-
-### Start the receiver bridges
-
-On Windows, use two separate terminals in `bridge/`:
+On Windows, use two separate terminals:
 
 ```powershell
-python cf_quicktunnel_writer.py --env-file .env
+python cf_quicktunnel_writer.py --env-file ".env"
 ```
 
 ```powershell
-python cf_quicktunnel_writer.py --env-file .env.files
+python cf_quicktunnel_writer.py --env-file ".env.files"
 ```
 
-The Python bridge processes must remain alive for a later remote restart request to work.
+Keep both Python processes running for remote restart requests.
 
-If they are stopped, flags cannot remotely start them; use an OS service or autostart arrangement when unattended recovery is required.
+Stop pauses the tunnel, not the receiving Python process. The pause state is not persistent: restarting Python enables the tunnel again.
 
-A tunnel pause disables automatic health-triggered restart.
+### File Browser
 
-The local HTTP server may still answer while cloudflared is paused.
+Open the current files Quick Tunnel URL to access the shared-folder overview.
 
-Therefore a local `GET 200` is not proof that the public tunnel is live.
+| Route | Directory |
+|---|---|
+| `/files/images/` | `FILES_IMAGES_DIR`, falling back to `FILES_ROOT` |
+| `/files/3d/` | `FILES_3D_DIR` |
+| `/files/mesh/` | `FILES_MESH_DIR` |
+| `/files/video/` | `FILES_VIDEO_DIR` |
 
-### Discovery, routes, and URL changes
+With the latest browser updates:
 
-Consult `cf_quicktunnel_writer.py` for the actual discovery path and schema.
+- Files appear in a vertical list.
+- Subdirectories are clickable.
+- File names open the original files.
+- Download links and Preview buttons use matching styling.
+- Images load only after clicking Preview.
+- Preview loads the full original image, not a reduced thumbnail.
+- `?list=json` returns file names instead of the HTML listing.
 
-The original writer behavior observed `tunnel_url.json` and text output in `OUT_DIR`, with upload to `FTPS_DIR` when enabled.
+`FILES_INDEX=true` enables directory listings. Disabling it does not prevent access to known file URLs.
 
-Fresh Quick Tunnel URLs change after a restart.
+The current implementation reads files fully into memory, including range requests. Large downloads may consume substantial memory.
 
-Discovery clearing during pause/stop is best effort, not a delivery guarantee.
+### Discovery and Health
 
-`/health` is bridge-only and is not a ComfyUI health assertion.
+Each receiver writes `tunnel_url.json` and `tunnel_url.txt` to its `OUT_DIR` and optionally uploads them to its `FTPS_DIR`.
 
-Optional image, 3D, mesh, and video routes depend on the writer implementation.
+The JSON contains `url` and `updated_at`.
 
-`?list=json` depends on `FILES_INDEX`; byte-range behavior depends on `FILES_RANGE` and implementation.
+Local bridge endpoints:
 
-### Remote control mailbox
+```text
+/health
+/bridge/tunnel_url.json
+/bridge/tunnel_url.txt
+```
 
-Use a sender machine, for example Ubuntu, to upload small JSON requests through FTPS.
+Quick Tunnel URLs may change after restart. Always use the current published URL.
 
-No remote shell command is sent or executed by the sender.
+Discovery clearing during pause or stop is best effort.
 
-The receiver polls the mailbox and executes its configured Comfy commands locally.
+`/health` reports bridge state, not ComfyUI readiness or public tunnel reachability.
 
-Polling is independent per receiver and is commonly configured for roughly 30 seconds; a Comfy launch can take longer.
+### Remote Control Mailbox
 
-No transaction, readiness acknowledgement, or process confirmation is provided.
+Create these directories before using remote controls:
 
-A sender tries all targets even if an earlier target fails, so partial failure is possible.
+```text
+/web-root/bridge/
+├── comfy/
+└── files/
+```
 
-For each target, it deletes the opposite flag only if present, then uploads the requested flag.
-
-No local control files or remote directories are created.
-
-All control JSON is built in memory.
-
-The required remote tree is:
+Senders upload temporary control flags:
 
 ```text
 /web-root/bridge/
@@ -267,54 +267,50 @@ The required remote tree is:
     └── stop.flag
 ```
 
-The corrected root handler applies root flags only to the tunnel, even when its action is `both`.
+- Root flags control the main tunnel.
+- `comfy/` flags control configured ComfyUI lifecycle commands.
+- `files/` flags control the files tunnel.
+- Stop takes precedence when conflicting flags are detected together.
+- The examples configure polling every 10 seconds.
+- Upload success does not confirm execution or readiness.
+- Independent receivers do not guarantee execution order.
 
-Only the `comfy/` subdirectory controls ComfyUI.
+A terminated Python receiver cannot be restarted through flags. Use an OS service or autostart for process recovery.
 
-For root tunnel flags, stop takes precedence over a conflicting restart.
+### Sender Commands
 
-A deleted flag is not proof that the requested action succeeded.
+Run from the directory containing the senders and their profiles.
 
-Typical receiver logs describe a root flag as detected and the tunnel as pausing or restarting.
+These commands connect to the configured FTPS server, except `--dry-run`.
 
-### Sender command table
-
-Run `python3` on Ubuntu-like systems and `python` on Windows.
-
-| Intent | Ubuntu example | Windows example |
+| Intent | Ubuntu | Windows |
 |---|---|---|
-| Stop all: files tunnel, main tunnel, Comfy | `python3 stop_all.py` | `python stop_all.py` |
-| Restart all: Comfy, files tunnel, main tunnel | `python3 restart_all.py` | `python restart_all.py` |
-| Validate all targets, no upload | `python3 stop_all.py --dry-run` | `python stop_all.py --dry-run` |
-| Stop both tunnel profiles only | `python3 stop_bridge.py` | `python stop_bridge.py` |
-| Restart both tunnel profiles only | `python3 restart_bridge.py` | `python restart_bridge.py` |
-| Stop only main tunnel | `python3 stop_bridge.py --env-file .env` | `python stop_bridge.py --env-file .env` |
-| Restart only files tunnel | `python3 restart_bridge.py --env-file .env.files` | `python restart_bridge.py --env-file .env.files` |
-| Stop only files tunnel | `python3 stop_files.py --env-file .env --files-env .env.files` | `python stop_files.py --env-file .env --files-env .env.files` |
-| Restart only files tunnel | `python3 restart_files.py --env-file .env --files-env .env.files` | `python restart_files.py --env-file .env --files-env .env.files` |
-| Only ComfyUI | use the supplied Comfy sender/version documentation | use the supplied Comfy sender/version documentation |
+| Stop everything | `python3 stop_all.py` | `python stop_all.py` |
+| Restart everything | `python3 restart_all.py` | `python restart_all.py` |
+| Validate stop targets | `python3 stop_all.py --dry-run` | `python stop_all.py --dry-run` |
+| Validate restart targets | `python3 restart_all.py --dry-run` | `python restart_all.py --dry-run` |
+| Stop both tunnels only | `python3 stop_bridge.py` | `python stop_bridge.py` |
+| Restart both tunnels only | `python3 restart_bridge.py` | `python restart_bridge.py` |
+| Stop main tunnel | `python3 stop_bridge.py --env-file .env` | `python stop_bridge.py --env-file .env` |
+| Restart main tunnel | `python3 restart_bridge.py --env-file .env` | `python restart_bridge.py --env-file .env` |
+| Stop files tunnel | `python3 stop_bridge.py --env-file .env.files` | `python stop_bridge.py --env-file .env.files` |
+| Restart files tunnel | `python3 restart_bridge.py --env-file .env.files` | `python restart_bridge.py --env-file .env.files` |
 
-This guide assumes `stop_bridge.py` and `restart_bridge.py` wrappers delegate to `bridge_control.main`.
+The wrappers control tunnels only, never ComfyUI.
 
-Older standalone `stop_bridge` versions can differ.
+For dedicated ComfyUI or legacy files senders, inspect that version's `--help`. Prefer the wrappers above for files-tunnel control.
 
-For unknown standalone Comfy sender details, use the original `--env-file .env --message "..."` style and inspect `--help` for that version.
+### All-Sender Options
 
-### All-sender options and examples
-
-`stop_all.py` and `restart_all.py` support the following options.
-
-| Option | Meaning |
+| Option | Purpose |
 |---|---|
-| `--env-file PATH` | Explicit main/base dotenv file. |
-| `--files-env PATH` | Explicit files overlay dotenv file. |
-| `--no-auto-env` | Do not discover `.env` and `.env.files`. |
-| `--message TEXT` | Include optional request text in the in-memory JSON. |
-| `--retries N` | Positive transfer attempts for each target. |
-| `--ftps-timeout SECONDS` | Positive finite FTPS timeout. |
-| `--dry-run` | Validate and print targets; do not upload or connect. |
-
-Use explicit paths and values when operating outside the bridge directory:
+| `--env-file PATH` | Main/base dotenv file |
+| `--files-env PATH` | Files overlay dotenv file |
+| `--no-auto-env` | Disable automatic dotenv discovery |
+| `--message TEXT` | Optional request message |
+| `--retries N` | Transfer attempts per target |
+| `--ftps-timeout SECONDS` | FTPS timeout |
+| `--dry-run` | Validate without connecting or uploading |
 
 ```bash
 python3 stop_all.py --env-file .env --files-env .env.files --message "maintenance" --retries 5 --ftps-timeout 30
@@ -324,47 +320,41 @@ python3 stop_all.py --env-file .env --files-env .env.files --message "maintenanc
 python3 restart_all.py --env-file .env --files-env .env.files --message "resume" --retries 5 --ftps-timeout 30
 ```
 
-The all-sender stop upload order is files tunnel, main tunnel, then Comfy.
+Stop upload order: files tunnel → main tunnel → ComfyUI.
 
-The all-sender restart upload order is Comfy, files tunnel, then main tunnel.
+Restart upload order: ComfyUI → files tunnel → main tunnel.
 
-Those are upload orders, not execution orders: separate pollers observe flags independently.
+These are upload orders, not guaranteed execution orders.
 
-### Exit codes and lifecycle scripts
+### Local Checks — Windows
 
-For all senders, exit `0` means every requested upload succeeded, or a dry run completed validation without uploads.
+```powershell
+Invoke-RestMethod "http://127.0.0.1:8799/health"
+Invoke-RestMethod "http://127.0.0.1:8800/health"
+Start-Process "http://127.0.0.1:8800/"
+```
 
-Exit `1` means a transfer failure or interruption.
+Display current public URLs:
 
-Exit `2` means configuration or argument parsing failure.
-
-An upload success never confirms receiver action.
-
-The local lifecycle scripts retain their own documented exit conventions: `0` success, `1` failure, and `2` already running.
-
-Interpret those codes for the respective lifecycle script, not as upload semantics.
-
-`-ForceStop` can interrupt work in progress.
+```powershell
+Get-Content ".\bridge_output\comfy\tunnel_url.txt"
+Get-Content ".\bridge_output\files\tunnel_url.txt"
+```
 
 ### Troubleshooting
 
-**Flags are never detected.** Check the exact target directory, account permissions for `LIST`/`NLST`, write, and delete, and that both receiver processes are still running.
+- **Cloudflared not found:** Check executable discovery or set an absolute `CLOUDFLARED` path.
+- **Files bridge uses port 8799:** Check the corrected profile loader and existing environment variables.
+- **Only “Cloudflared URL bridge” appears:** Check `FILES_ENABLE=true`, the selected profile, and the file-browser update.
+- **Directory appears as JSON:** Remove `?list=json` from the URL or navigation links.
+- **Preview loads automatically:** Replace the old image block with the manual Preview implementation.
+- **Flags are ignored:** Check receiver processes, FTPS directories, permissions, and `FTPS_FLAG_ACTION`.
+- **Files target becomes `/files/files`:** Set `FTPS_FILES_DIR` explicitly for legacy files senders.
+- **Upload succeeds but nothing happens:** Allow for polling and check receiver logs and lifecycle commands.
+- **Public tunnel is unavailable:** Inspect cloudflared logs and use the latest published URL.
+- **Browser changes are missing:** Restart the files receiver and reload the page.
 
-**Files commands hit `/files/files`.** Define `FTPS_FILES_DIR=/web-root/bridge/files` explicitly in the relevant profile.
-
-**The tunnel seems healthy locally but is unavailable publicly.** A local health `GET 200` does not prove a public Quick Tunnel; inspect cloudflared and bridge logs.
-
-**ComfyUI repeatedly starts or stops.** Install the corrected control patch, remove stale flags, and avoid concurrent controllers.
-
-**Upload succeeded but nothing happened.** Upload confirmation is not execution confirmation; allow the polling interval and check receiver logs and configured commands.
-
-**Restart cannot revive the bridge.** Flags can control a running bridge only; use OS service/autostart for a terminated Python process.
-
-**Sender behavior differs.** Confirm script generation and run `--help`; old standalone helpers and pasted files senders are not interchangeable.
-
-### Git hygiene
-
-Keep local secrets and generated discovery output out of version control:
+### Git Hygiene
 
 ```gitignore
 .env
