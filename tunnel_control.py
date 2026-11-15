@@ -99,28 +99,81 @@ def install(ns):
  TW.__init__=init;TW.request_pause=pause;TW.request_restart=restart;TW.stop=stop;TW.is_running=running;TW.is_paused=paused;TW.run_forever=loop
  if FW:
   def one(self):
-   # Root controls affect tunnel only; Comfy controls retain their separate behavior.
+   """Process one FTPS control poll without coupling root and Comfy actions."""
+   # Do not open a connection for a disabled or incompletely configured watcher.
+   if not getattr(self, 'enabled', False):
+    return
+   host=getattr(self, 'host', '')
+   user=getattr(self, 'user', '')
+   password=getattr(self, 'password', '')
+   remote_dir=getattr(self, 'remote_dir', '')
+   if not all(isinstance(value, str) and value for value in (host, user, password, remote_dir)):
+    return
+
+   def consume(f, path, name):
+    """Delete a detected flag, returning whether its acknowledgement succeeded."""
+    try:
+     f.cwd(path)
+     f.delete(name)
+     return True
+    except Exception:
+     LOG.warning('Failed to consume control flag %s', name)
+     print('FTPS control flag consumption failed: %s' % name, flush=True)
+     return False
+
    try:
-    with verified_ftps_connect(self.host,self.user,self.password) as f:
-     root=getattr(self,'remote_dir','') or '/'; action=getattr(self,'action','cloudflared'); stopn=os.getenv('FTPS_TUNNEL_STOP_FLAG','stop.flag'); rn=getattr(self,'flag_name','')
-     if action in ('cloudflared','both') and _plain(stopn):
-      hasstop=self._check_path_for_name(f,root,stopn); hasrestart=_plain(rn) and self._check_path_for_name(f,root,rn)
-      if hasstop:
-       # acknowledge only after deletion; stop wins and conflicting restart is consumed best effort
-       try:self._delete_flag(f,root,stopn)
-       except Exception: LOG.warning('failed to consume stop flag')
-       else:
-        self.tw.request_pause()
-        if hasrestart:
-         try:self._delete_flag(f,root,rn)
-         except Exception:LOG.warning('failed to consume conflicting restart flag')
-      elif hasrestart:
-       try:self._delete_flag(f,root,rn)
-       except Exception:LOG.warning('failed to consume restart flag')
-       else:self.tw.request_restart(manual=True)
-     if action in ('comfy','both') and _subdir(getattr(self,'comfy_subdir','')):
-      # original separate semantics: restart then stop; root flags never invoke these.
-      self._handle_comfy_restart(); self._handle_comfy_stop()
-   except Exception: LOG.warning('FTPS flag poll failed')
+    with verified_ftps_connect(host, user, password) as f:
+     root=remote_dir
+     action=getattr(self, 'action', 'cloudflared')
+     root_stop=os.getenv('FTPS_TUNNEL_STOP_FLAG', 'stop.flag')
+     root_restart=getattr(self, 'flag_name', '')
+
+     # Root flags control cloudflared only. A root stop always pauses for safety,
+     # even if its remote acknowledgement cannot be deleted.
+     if action in ('cloudflared', 'both') and _plain(root_stop):
+      has_root_stop=self._check_path_for_name(f, root, root_stop)
+      has_root_restart=(_plain(root_restart) and
+                        self._check_path_for_name(f, root, root_restart))
+      if has_root_stop:
+       print('FTPS control flag detected: root stop', flush=True)
+       if has_root_restart and root_restart != root_stop:
+        print('FTPS control flag detected: conflicting root restart', flush=True)
+        consume(f, root, root_restart)
+       # Never process a restart in a stop cycle, regardless of deletion results.
+       consume(f, root, root_stop)
+       print('FTPS control action: pausing tunnel', flush=True)
+       self.tw.request_pause()
+      elif has_root_restart:
+       print('FTPS control flag detected: root restart', flush=True)
+       if consume(f, root, root_restart):
+        print('FTPS control action: restarting tunnel', flush=True)
+        self.tw.request_restart(manual=True)
+
+     # Comfy flags live under the configured subdirectory and are independent
+     # from root tunnel flags. Stop wins when both are present.
+     comfy_subdir=getattr(self, 'comfy_subdir', '')
+     if action in ('comfy', 'both') and _subdir(comfy_subdir):
+      comfy_path=posixpath.join(root.rstrip('/') or '/', comfy_subdir)
+      comfy_restart='restart.flag'
+      comfy_stop=getattr(self, 'comfy_stop_flag', 'stop.flag') or 'stop.flag'
+      has_comfy_restart=self._check_path_for_name(f, comfy_path, comfy_restart)
+      has_comfy_stop=(_plain(comfy_stop) and
+                      self._check_path_for_name(f, comfy_path, comfy_stop))
+      if has_comfy_stop:
+       print('FTPS control flag detected: Comfy stop', flush=True)
+       if has_comfy_restart and comfy_restart != comfy_stop:
+        print('FTPS control flag detected: conflicting Comfy restart', flush=True)
+        consume(f, comfy_path, comfy_restart)
+       # Do not run a Comfy restart in a Comfy stop cycle.
+       if consume(f, comfy_path, comfy_stop):
+        print('FTPS control action: stopping Comfy', flush=True)
+        self._handle_comfy_stop()
+      elif has_comfy_restart:
+       print('FTPS control flag detected: Comfy restart', flush=True)
+       if consume(f, comfy_path, comfy_restart):
+        print('FTPS control action: restarting Comfy', flush=True)
+        self._handle_comfy_restart()
+   except Exception:
+    LOG.warning('FTPS flag poll failed')
   FW._one_cycle=one
  ns['_tunnel_control_installed']=True
