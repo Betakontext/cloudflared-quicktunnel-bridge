@@ -50,7 +50,7 @@ workspace/
     ├── restart_comfyui.py
     ├── stop_comfyui.ps1
     ├── restart_comfyui.ps1
-    ├── cloudflared-windows-amd64.exe
+    ├── cloudflared-windows-amd64.exe 
     ├── .env
     ├── .env.files
     └── bridge_output/
@@ -78,10 +78,15 @@ With the executable-discovery correction applied, an empty `CLOUDFLARED=` search
 - Linux/macOS: `cloudflared`.
 - Otherwise, falls back to `cloudflared` through `PATH`.
 
-An explicitly configured executable overrides discovery. Prefer an absolute path:
+An explicitly configured executable overrides discovery.
 
-```dotenv
-CLOUDFLARED=C:/Tools/cloudflared/cloudflared-windows-amd64.exe
+Preset is in .env is an absolute path:
+
+Get it f.e. from https://developers.cloudflare.com/tunnel/downloads/
+and place it here in the Project root. 
+
+```dotenv 
+CLOUDFLARED=./cloudflared-windows-amd64.exe
 ```
 
 ### Main Receiver Profile: `.env`
